@@ -55,10 +55,49 @@ One-step generation with MeanFlow (`num_sampling_steps=1`, a single network eval
 
 ## Requirements
 
-* `scipy` — for the default `flow_matcher_type="exact"` only (`pip install 'lerobot[scipy-dep]'`).
-  `conditional`, `mean`, `improved_mean` and `consistency` need nothing extra.
-* `diffusers` — for the cosine LR schedule at training time, as for the diffusion policy
-  (`pip install 'lerobot[diffusion]'`).
+Everything VITA needs is declared by the `vita` extra:
+
+```bash
+pip install 'lerobot[vita]'
+```
+
+which resolves to:
+
+| package | version | needed for | required? |
+|---|---|---|---|
+| `scipy` | `>=1.14.0,<2.0.0` | the default `flow_matcher_type="exact"` (optimal-transport coupling) | only for `exact`; `conditional`, `mean`, `improved_mean` and `consistency` work without it |
+| `diffusers` | `>=0.27.2,<0.36.0` | the cosine LR schedule preset at training time, as for the diffusion policy | yes, to train via `lerobot-train` |
+
+Nothing else: no `torchcfm`, no `timm`, no `POT`. The flow matchers and every network are
+self-contained in this directory.
+
+### Deploying to the robot-platform cluster
+
+Training nodes run the shared venv at `/opt/robot-platform/train-venv`, installed by
+`scripts/25-install-training-environment.sh`. Which extras it installs comes from
+`LEROBOT_EXTRAS` in `config/site.env` — `vita` is in the default list, so a **fresh** install
+already covers both packages.
+
+An **existing** node is the case to watch. `scipy` is already present there (the `pi` extra pulls
+it in), but `diffusers` is not, and `--sync-lerobot` copies source files without resolving
+dependencies. The sync detects this and stops with the exact command; it is:
+
+```bash
+sudo /opt/robot-platform/train-venv/bin/pip install 'diffusers>=0.27.2,<0.36.0'
+```
+
+Run it once per node, then re-run the sync. Rolling a code change out to a node:
+
+```bash
+cd ~/YING/robot_data_platform
+git pull
+git submodule update --init --recursive          # move lerobot/ to the recorded commit
+sudo ./scripts/25-install-training-environment.sh --sync-lerobot --apply
+```
+
+The sync writes the submodule revision it copied to
+`<site-packages>/lerobot/SUBMODULE_REVISION`, because pip's own metadata still describes whatever
+it last installed and will not reflect a synced tree.
 
 ## Caveat: minibatch OT coupling changes the pairing
 
