@@ -60,6 +60,7 @@ from .pretrained import PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
 from .utils import validate_visual_features_consistency
+from .vita.configuration_vita import VitaConfig
 from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig
 from .vqbet.configuration_vqbet import VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig
@@ -121,6 +122,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .vqbet.modeling_vqbet import VQBeTPolicy
 
         return VQBeTPolicy
+    elif name == "vita":
+        from .vita.modeling_vita import VitaPolicy
+
+        return VitaPolicy
     elif name == "pi0":
         from .pi0.modeling_pi0 import PI0Policy
 
@@ -213,6 +218,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":
         return VQBeTConfig(**kwargs)
+    elif policy_type == "vita":
+        return VitaConfig(**kwargs)
     elif policy_type == "pi0":
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
@@ -390,6 +397,14 @@ def make_pre_post_processors(
         from .vqbet.processor_vqbet import make_vqbet_pre_post_processors
 
         processors = make_vqbet_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, VitaConfig):
+        from .vita.processor_vita import make_vita_pre_post_processors
+
+        processors = make_vita_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
