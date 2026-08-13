@@ -15,6 +15,7 @@
 from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterpolator
 
 from .act.configuration_act import ACTConfig as ACTConfig
+from .act_delta.configuration_act_delta import ACTDeltaConfig as ACTDeltaConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
 from .evo1.configuration_evo1 import Evo1Config as Evo1Config
@@ -44,6 +45,7 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 __all__ = [
     # Configuration classes
     "ACTConfig",
+    "ACTDeltaConfig",
     "DiffusionConfig",
     "EO1Config",
     "FastWAMConfig",
