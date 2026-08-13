@@ -68,8 +68,8 @@ class VitaConfig(PreTrainedConfig):
 
     # Inputs / output structure.
     n_obs_steps: int = 1
-    horizon: int = 16
-    n_action_steps: int = 8
+    horizon: int = 64 
+    n_action_steps: int = 32
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -80,7 +80,7 @@ class VitaConfig(PreTrainedConfig):
     )
 
     # horizon - n_action_steps - n_obs_steps + 1
-    drop_n_last_frames: int = 8
+    drop_n_last_frames: int = 32
 
     # Vision backbone. VITA uses a shared ImageNet ResNet-18 with frozen BatchNorm and global
     # average pooling (one 512-d vector per camera), not per-camera encoders with SpatialSoftmax.
