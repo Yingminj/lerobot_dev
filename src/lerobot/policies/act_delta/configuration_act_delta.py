@@ -112,10 +112,10 @@ class ACTDeltaConfig(PreTrainedConfig):
     optimizer_lr_backbone: float = 1e-5
 
     # --- Relative action representation (the only functional difference vs `act`) ---
-    use_relative_actions: bool = False
+    use_relative_actions: bool = True
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
     action_feature_names: list[str] | None = None
-    relative_consistency_check: str = "warn"
+    relative_consistency_check: str = "error"
     allow_unsafe_relative_select_action: bool = False
 
     def __post_init__(self):
