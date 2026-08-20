@@ -207,6 +207,9 @@ phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerob
 diffusion = ["lerobot[diffusers-dep]"]
 # diffusers: cosine LR scheduler preset. scipy: the default `exact` (optimal transport) flow matcher.
 vita = ["lerobot[diffusers-dep]", "lerobot[scipy-dep]"]
+# transformers: DINOv3 / WebSSL / SigLIP2 / V-JEPA2 frozen backbones (DINOv2 comes from torch.hub).
+# diffusers: DDPM/DDIM scheduler for the `action_head="diffusion"` variant.
+patch_policy = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]"]
 wallx = [
     "lerobot[transformers-dep]",
     "lerobot[peft-dep]",
