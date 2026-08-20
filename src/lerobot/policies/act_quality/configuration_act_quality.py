@@ -14,7 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for ACT with hard masks over low-quality actions."""
+"""Configuration for ACT with hard masks over low-quality actions.
+
+``ACTQualityConfig`` deliberately subclasses the upstream ``ACTConfig``.  All
+standard ACT fields (chunk size, architecture, VAE, inference, normalization,
+and optimizer fields) are therefore constructor arguments and CLI options of
+this config as well.  Only the quality-specific additions are declared below.
+"""
 
 from dataclasses import dataclass
 
@@ -27,9 +33,13 @@ from lerobot.policies.act.configuration_act import ACTConfig
 class ACTQualityConfig(ACTConfig):
     """ACT configuration extended with a per-frame action-quality label.
 
-    The network architecture is identical to upstream ACT.  The additional
-    fields only control target selection and loss masking, so ACT checkpoints
-    remain weight-compatible with this policy.
+    The network architecture is identical to upstream ACT.  Inherited fields
+    include ``chunk_size``, ``n_action_steps``, ``vision_backbone``,
+    ``dim_model``, ``n_heads``, all encoder/decoder and CVAE settings,
+    ``temporal_ensemble_coeff``, ``dropout``, ``kl_weight``, normalization, and
+    optimizer settings.  The fields declared here only control target
+    selection and loss masking, so ACT checkpoints remain weight-compatible
+    with this policy.
     """
 
     quality_label_key: str = "action_quality"

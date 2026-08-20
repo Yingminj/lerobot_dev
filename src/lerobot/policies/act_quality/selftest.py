@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import tempfile
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,8 @@ import torch
 from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 
 from .configuration_act_quality import ACTQualityConfig
@@ -73,6 +76,28 @@ def _quality_index() -> QualityIndex:
 
 def test_registration() -> None:
     assert PreTrainedConfig.get_choice_class("act_quality") is ACTQualityConfig
+
+
+def test_upstream_act_compatibility() -> None:
+    """Guard against losing inherited ACT options or changing model weights."""
+    act_fields = {field.name for field in fields(ACTConfig)}
+    quality_fields = {field.name for field in fields(ACTQualityConfig)}
+    assert act_fields <= quality_fields
+
+    quality_config = _config()
+    act_kwargs = {
+        field.name: getattr(quality_config, field.name)
+        for field in fields(ACTConfig)
+    }
+    torch.manual_seed(7)
+    act_policy = ACTPolicy(ACTConfig(**act_kwargs))
+    torch.manual_seed(7)
+    quality_policy = ACTQualityPolicy(quality_config)
+    act_state = act_policy.state_dict()
+    quality_state = quality_policy.state_dict()
+    assert list(act_state) == list(quality_state)
+    assert all(act_state[key].shape == quality_state[key].shape for key in act_state)
+    assert all(torch.equal(act_state[key], quality_state[key]) for key in act_state)
 
 
 def test_sampler() -> None:
@@ -208,6 +233,7 @@ def test_parquet_alignment() -> None:
 
 def main() -> None:
     test_registration()
+    test_upstream_act_compatibility()
     test_sampler()
     test_balanced_sampler()
     test_all_valid_recovery_provenance()

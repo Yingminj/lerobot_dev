@@ -15,6 +15,16 @@ The ACT network architecture and state-dict names are unchanged.  The package ad
 8. separate normal-success and recovery anchor pools with a configurable
    recovery sampling fraction.
 
+## ACT configuration inheritance
+
+`ACTQualityConfig` subclasses the upstream `ACTConfig`; it does not replace it.
+Consequently every standard ACT option remains available under `--policy.*`,
+including `chunk_size`, `n_action_steps`, backbone and transformer dimensions,
+CVAE settings, `temporal_ensemble_coeff`, `dropout`, `kl_weight`, normalization,
+and optimizer settings. `configuration_act_quality.py` only declares the eight
+additional quality options. Keeping one upstream definition prevents the two
+ACT configurations from silently drifting apart.
+
 ## Required label semantics
 
 For every episode, labels must have one of these forms:
@@ -39,7 +49,8 @@ normal success. Only valid frames enter either anchor pool.
 Load the package through LeRobot's existing plugin interface:
 
 ```bash
-lerobot-train \
+PYTHONPATH=/home/snorlax/repo/robot_data_platform/lerobot/src \
+/home/snorlax/.conda/envs/lerobot/bin/lerobot-train \
   --policy.discover_packages_path=lerobot.policies.act_quality \
   --policy.type=act_quality \
   --policy.chunk_size=100 \
