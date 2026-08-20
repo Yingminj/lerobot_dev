@@ -47,8 +47,6 @@ class ACTPolicy(PreTrainedPolicy):
 
     config_class = ACTConfig
     name = "act"
-    # Subclasses (e.g. `act_dit`) swap in their own inner module without re-implementing __init__.
-    model_class: "type[nn.Module] | None" = None  # bound to `ACT` at the end of this module.
 
     def __init__(
         self,
@@ -64,7 +62,7 @@ class ACTPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        self.model = self.model_class(config)
+        self.model = ACT(config)
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
@@ -292,9 +290,6 @@ class ACT(nn.Module):
                                 └───────────────────────┘
     """
 
-    # Subclasses (e.g. `act_dit`) swap in their own decoder. Set to `ACTDecoder` below, once defined.
-    decoder_class: "type[nn.Module] | None" = None
-
     def __init__(self, config: ACTConfig):
         # BERT style VAE encoder with input tokens [cls, robot_state, *action_sequence].
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
@@ -340,7 +335,7 @@ class ACT(nn.Module):
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
-        self.decoder = self.decoder_class(config)
+        self.decoder = ACTDecoder(config)
 
         # Transformer encoder input projections. The tokens will be structured like
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
@@ -382,13 +377,8 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def encode_observations(
-        self, batch: dict[str, Tensor]
-    ) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
-        """Run the VAE encoder (if enabled) and the transformer encoder over the observations.
-
-        Split out of `forward` so that a decoder can be run repeatedly against one encoder pass
-        (see `lerobot.policies.act_dit`, whose denoiser calls the decoder 4-10 times per chunk).
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+        """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
         {
@@ -402,8 +392,7 @@ class ACT(nn.Module):
         }
 
         Returns:
-            (ES, B, C) encoder output tokens.
-            (ES, 1, C) encoder positional embeddings (needed again as cross-attention keys).
+            (B, chunk_size, action_dim) batch of action sequences
             Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
             latent dimension.
         """
@@ -502,22 +491,6 @@ class ACT(nn.Module):
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
-
-        return encoder_out, encoder_in_pos_embed, (mu, log_sigma_x2)
-
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
-        """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
-
-        See `encode_observations` for the expected `batch` structure.
-
-        Returns:
-            (B, chunk_size, action_dim) batch of action sequences
-            Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
-            latent dimension.
-        """
-        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
-        encoder_out, encoder_in_pos_embed, (mu, log_sigma_x2) = self.encode_observations(batch)
-
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),
@@ -690,10 +663,6 @@ class ACTDecoderLayer(nn.Module):
         if not self.pre_norm:
             x = self.norm3(x)
         return x
-
-
-ACTPolicy.model_class = ACT
-ACT.decoder_class = ACTDecoder
 
 
 def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:

@@ -36,6 +36,7 @@ high-dimensional, spatially structured visual tokens stay on cross-attention. Ab
 (`use_cross_attention=False`) collapses that to adaLN-only for measurement purposes.
 """
 
+import einops
 import torch
 from torch import Tensor, nn
 
@@ -46,7 +47,7 @@ from lerobot.policies.multi_task_dit.modeling_multi_task_dit import (
     SinusoidalPosEmb,
     modulate,
 )
-from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from .configuration_act_dit import ACTDiTConfig
 
@@ -64,6 +65,12 @@ class ACTDiTPolicy(ACTPolicy):
 
     def __init__(self, config: ACTDiTConfig, **kwargs):
         super().__init__(config, **kwargs)
+        # `ACTPolicy.__init__` hard-codes `self.model = ACT(config)`, so the denoiser replaces it
+        # here rather than in `act/modeling_act.py`, which stays untouched. Deferring to super()
+        # first (instead of copying its body) keeps this correct if ACTPolicy.__init__ grows a
+        # line; the cost is one discarded ACT, a transient allocation at construction time.
+        self.model = ACTDiT(config)
+
         objective_cls = FlowMatchingObjective if config.objective == "flow_matching" else DiffusionObjective
         self.objective = objective_cls(
             config,
@@ -104,7 +111,15 @@ class ACTDiT(ACT):
     """
 
     def __init__(self, config: ACTDiTConfig):
-        super().__init__(config)  # builds `self.decoder` from `decoder_class` (bound below)
+        super().__init__(config)
+
+        # Same story as the policy: `ACT.__init__` hard-codes `self.decoder = ACTDecoder(config)`.
+        # Replace it, then redo the xavier init `ACT._reset_parameters` applied to the decoder we
+        # just dropped.
+        self.decoder = ACTDiTDecoder(config)
+        for p in self.decoder.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
 
         # The decoder input is a noisy action chunk instead of ACT's zeros.
         self.action_in_proj = nn.Linear(config.action_feature.shape[0], config.dim_model)
@@ -116,10 +131,50 @@ class ACTDiT(ACT):
         )
 
         # adaLN-Zero: gates start closed so the block starts as the identity, as in DiT.
-        # Applied after ACT's `_reset_parameters`, which xavier-inits every decoder weight.
+        # Applied after the xavier init above, so the zeros win.
         for layer in self.decoder.layers:
             nn.init.zeros_(layer.adaln[-1].weight)
             nn.init.zeros_(layer.adaln[-1].bias)
+
+    def encode_observations(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Run ACT's transformer encoder over the observations, once per chunk.
+
+        Mirrors the encoder half of `ACT.forward`, minus the CVAE branch: `ACTDiTConfig`
+        refuses `use_vae=True`, so ACT's latent is unconditionally the zero vector and the
+        VAE encoder is never built. Kept here rather than factored out of `act/` so that
+        `act/modeling_act.py` stays untouched; every module it touches is ACT's own, so the
+        only thing that can drift is the *order* of the encoder tokens, which shows up
+        immediately as a shape or quality regression, not silently.
+
+        Returns:
+            (ES, B, C) encoder output tokens.
+            (ES, 1, C) encoder positional embeddings (needed again as cross-attention keys).
+        """
+        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+
+        # ACT's zeroed latent token: the shape the encoder expects, carrying no information.
+        latent_sample = torch.zeros(
+            [batch_size, self.config.latent_dim], dtype=torch.float32, device=batch[OBS_STATE].device
+        )
+        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+        if self.config.robot_state_feature:
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+        if self.config.env_state_feature:
+            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+
+        if self.config.image_features:
+            # For a list of images, the H and W may vary but H*W is constant.
+            for img in batch[OBS_IMAGES]:
+                cam_features = self.backbone(img)["feature_map"]
+                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                encoder_in_tokens.extend(list(einops.rearrange(cam_features, "b c h w -> (h w) b c")))
+                encoder_in_pos_embed.extend(list(einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")))
+
+        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
+        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        return self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed), encoder_in_pos_embed
 
     def encode_conditioning(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor | None]:
         """Encode the observations once; returns everything the denoiser needs per step.
@@ -129,7 +184,7 @@ class ACTDiT(ACT):
             (ES, 1, C) their positional embeddings,
             (B, static_cond_dim) the chunk-constant part of the adaLN conditioning, or None.
         """
-        encoder_out, encoder_pos_embed, _ = self.encode_observations(batch)
+        encoder_out, encoder_pos_embed = self.encode_observations(batch)
 
         static_cond = []
         if self.config.robot_state_feature:
@@ -269,8 +324,3 @@ class ACTDiTDecoderLayer(ACTDecoderLayer):
         h = modulate(self.norm3(x), shift_ff, scale_ff)
         x = x + gate_ff * self.dropout3(self.linear2(self.dropout(self.activation(self.linear1(h)))))
         return x
-
-
-# Bound after the classes exist, like `act`'s own `ACTPolicy.model_class` / `ACT.decoder_class`.
-ACTDiTPolicy.model_class = ACTDiT
-ACTDiT.decoder_class = ACTDiTDecoder

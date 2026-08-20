@@ -188,7 +188,7 @@ first few hundred steps is the design, not a bug — `selftest.py` asserts this 
 | # | module | input | output | notes |
 |---|---|---|---|---|
 | 1 | `_prepare_batch` | `observation.state (B,16)`, `observation.images.* (B,3,480,640)` | same + `observation.images` as a **list** of 3 tensors | inherited packing convention from `ACTPolicy` |
-| 2 | `ACT.encode_observations` → `backbone` (ResNet18, frozen BN) | `(B,3,480,640)` per camera | `(B,512,15,20)` feature map | ImageNet weights by default; 480/32=15, 640/32=20 |
+| 2 | `ACTDiT.encode_observations` → `backbone` (ResNet18, frozen BN) | `(B,3,480,640)` per camera | `(B,512,15,20)` feature map | ImageNet weights by default; 480/32=15, 640/32=20 |
 | 3 | `encoder_cam_feat_pos_embed` (`ACTSinusoidalPositionEmbedding2d`) | `(B,512,15,20)` | `(B,512,15,20)` positional map | **known ACT defect: identical for every camera** — see §8 |
 | 4 | `encoder_img_feat_input_proj` (Conv2d 1×1) | `(B,512,15,20)` | `(B,512,15,20)` → rearranged `(300,B,512)` | one token per feature-map cell |
 | 5 | `encoder_robot_state_input_proj` (Linear) | `(B,16)` | `(1,B,512)` token | **reused twice**: as an encoder token *and* as the static adaLN conditioning |
@@ -266,7 +266,8 @@ not trip over parameters that never receive gradient.
 - `ACTPolicy` — `select_action`, the action queue, `ACTTemporalEnsembler`, `reset`,
   `get_optim_params` are inherited untouched. Chunk semantics are ACT's; only chunk *production*
   differs.
-- `ACT.encode_observations` — backbone, encoder, token assembly, all of it.
+- `ACT`'s module tree — backbone, `ACTEncoder`, every input projection, `decoder_pos_embed` and
+  `action_head` are inherited by `ACTDiT` and keep ACT's parameter names.
 - `multi_task_dit`'s `FlowMatchingObjective` / `DiffusionObjective` / `SinusoidalPosEmb` / `modulate`
   — their `model(x, t, conditioning_vec=…)` contract is precisely what `ACTDiT.forward` implements,
   which is why `conditioning_vec` can be an opaque 3-tuple instead of a flat vector.
@@ -281,12 +282,26 @@ not trip over parameters that never receive gradient.
 
 | file | edit |
 |---|---|
-| `policies/act/modeling_act.py` | `ACT.forward` split into `encode_observations` + `forward` (pure code move, so the encoder can be hoisted out of the sampling loop) |
-| `policies/act/modeling_act.py` | two class-attribute hooks: `ACTPolicy.model_class`, `ACT.decoder_class`, bound to `ACT`/`ACTDecoder` at the end of the module |
 | `policies/__init__.py` | one import line, so `@PreTrainedConfig.register_subclass("act_dit")` runs |
 
-ACT's numerics are unchanged; `selftest.py::test_act_refactor_is_equivalent` asserts that
-`encode_observations` + a manual decode reproduces `ACT.forward` exactly.
+That is the whole list — `policies/act/` is **not** modified. Two consequences, both handled inside
+this folder:
+
+- `ACTPolicy.__init__` hard-codes `self.model = ACT(config)` and `ACT.__init__` hard-codes
+  `self.decoder = ACTDecoder(config)`. `ACTDiTPolicy` / `ACTDiT` call `super().__init__` and then
+  *replace* the attribute, re-running the xavier init that `ACT._reset_parameters` applied to the
+  discarded decoder. Deferring to `super()` rather than copying its body means an upstream change to
+  either `__init__` still lands; the price is one ACT built and thrown away per policy construction
+  (a transient allocation, not a leak).
+- `ACT.forward` fuses the encoder and decoder passes, but S1 needs the encoder hoisted out of the
+  ODE loop. `ACTDiT.encode_observations` reimplements the encoder half locally — ~25 lines, because
+  `ACTDiTConfig` refuses `use_vae=True` and so the entire CVAE branch of `ACT.forward` collapses to
+  a zero latent token. Every module it calls is still ACT's own, so the only thing that can drift is
+  the *order* of the encoder tokens.
+
+`selftest.py::test_encode_observations_matches_act` pins exactly that: it loads an ACT's
+`state_dict` into an `ACTDiT` (asserting zero unexpected keys, which is also the S3 warm-start
+property) and asserts the two encoder outputs match to `1e-6`.
 
 ---
 

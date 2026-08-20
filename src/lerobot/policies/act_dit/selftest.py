@@ -2,7 +2,8 @@
 """Runnable self-check for ACT-DiT. `python -m lerobot.policies.act_dit.selftest`.
 
 Covers the three things that break silently:
-  1. the ACT refactor (`encode_observations`) still reproduces ACT's own forward,
+  1. `ACTDiT.encode_observations` still reproduces ACT's own encoder pass (it duplicates
+     ~25 lines of `ACT.forward` so that `act/modeling_act.py` stays untouched),
   2. the encoder runs ONCE per chunk while the decoder runs once per integration step
      (the whole cost argument of S1 rests on this),
   3. both conditioning arms train: with cross-attention (S1) and without (ablation D).
@@ -61,26 +62,27 @@ def _act_config(cls, **kw):
     )
 
 
-def test_act_refactor_is_equivalent():
-    """`encode_observations` + decode == `ACT.forward`, i.e. the split changed nothing."""
+def test_encode_observations_matches_act():
+    """ACTDiT's local encoder path == ACT's, so the duplicated lines cannot drift unnoticed."""
     torch.manual_seed(0)
-    policy = ACTPolicy(_act_config(ACTConfig, use_vae=False)).eval()
-    model, batch = policy.model, _batch()
+    act = ACTPolicy(_act_config(ACTConfig, use_vae=False)).eval()
+    dit = ACTDiTPolicy(_act_config(ACTDiTConfig)).eval()
+    # Every module ACTDiT reuses keeps ACT's parameter name, so an ACT checkpoint warm-starts
+    # act_dit (scheme S3). Nothing in ACT may be unknown to ACTDiT.
+    _missing, unexpected = dit.model.load_state_dict(act.model.state_dict(), strict=False)
+    assert not unexpected, unexpected
+
+    batch = _batch()
     batch[OBS_IMAGES] = [batch[OBS_IMAGE]]  # the image-list packing `ACTPolicy` does
+    captured = []
+    act.model.encoder.register_forward_hook(lambda _m, _i, out: captured.append(out))
 
     with torch.no_grad():
-        actions, _ = model(batch)
-        encoder_out, pos, (mu, log_sigma) = model.encode_observations(batch)
-        decoder_out = model.decoder(
-            torch.zeros(CHUNK, BATCH, model.config.dim_model),
-            encoder_out,
-            encoder_pos_embed=pos,
-            decoder_pos_embed=model.decoder_pos_embed.weight.unsqueeze(1),
-        )
-        manual = model.action_head(decoder_out.transpose(0, 1))
+        act.model(batch)
+        mine, pos = dit.model.encode_observations(batch)
 
-    assert mu is None and log_sigma is None, "use_vae=False must yield no latent params"
-    assert torch.allclose(actions, manual, atol=1e-6), (actions - manual).abs().max()
+    assert torch.allclose(captured[0], mine, atol=1e-6), (captured[0] - mine).abs().max()
+    assert pos.shape == (mine.shape[0], 1, mine.shape[2]), pos.shape
 
 
 def test_encoder_runs_once_per_chunk():
