@@ -17,6 +17,7 @@ from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterp
 from .act.configuration_act import ACTConfig as ACTConfig
 from .act_delta.configuration_act_delta import ACTDeltaConfig as ACTDeltaConfig
 from .act_dit.configuration_act_dit import ACTDiTConfig as ACTDiTConfig
+from .act_quality.configuration_act_quality import ACTQualityConfig as ACTQualityConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
 from .evo1.configuration_evo1 import Evo1Config as Evo1Config
@@ -49,6 +50,7 @@ __all__ = [
     "ACTConfig",
     "ACTDeltaConfig",
     "ACTDiTConfig",
+    "ACTQualityConfig",
     "DiffusionConfig",
     "EO1Config",
     "FastWAMConfig",
