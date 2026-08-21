@@ -229,8 +229,8 @@ class PatchPolicyConfig(PreTrainedConfig):
 
     # Inputs / output structure. Defaults are the Push-T preset (`configs/train_pusht.yaml`).
     n_obs_steps: int = 5
-    action_chunk_size: int = 5
-    n_action_steps: int = 5
+    action_chunk_size: int = 50
+    n_action_steps: int = 50
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -243,7 +243,7 @@ class PatchPolicyConfig(PreTrainedConfig):
     )
 
     # Which head consumes the patch tokens.
-    action_head: str = "vqbet"  # "vqbet" | "diffusion" | "act"
+    action_head: str = "act"  # "vqbet" | "diffusion" | "act"
 
     # Frozen visual encoder.
     vision_encoder: str = "dino_patch"
