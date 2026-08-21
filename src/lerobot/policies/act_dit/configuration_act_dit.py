@@ -51,6 +51,17 @@ class ACTDiTConfig(ACTConfig):
         use_vae: Inherited, but defaults to False - the flow/diffusion objective now
             carries the distribution, so the CVAE latent (which ACT zeroes at inference
             anyway) is redundant.
+        use_ema: Keep an exponential moving average of the denoiser weights and sample from
+            it in eval mode. Off by default because it doubles the checkpoint and cannot be
+            switched on mid-run (see `ema_decay`). The reference flow/diffusion policies all
+            train this way - `configuration_patch_policy.py` and `modeling_vita.py` document
+            the same gap - because the velocity/noise target is a high-variance regression:
+            the same (observation, chunk) pair gets a different target on every step
+            depending on the sampled `t` and noise, so the iterates never settle. ACT's L1
+            target has no such per-sample randomness, which is why `act` never needed this.
+        ema_decay: Averaging horizon, ~1/(1-decay) steps. The default 0.9999 is ~10k steps,
+            sized for runs of 100k+; drop it to 0.999 for runs shorter than ~20k or the
+            average lags the weights for most of training.
     """
 
     # ACT overrides: the decoder is now a denoiser, and the CVAE is redundant.
@@ -81,6 +92,10 @@ class ACTDiTConfig(ACTConfig):
     clip_sample: bool = True
     clip_sample_range: float = 1.0
     num_inference_steps: int | None = 10
+
+    # --- Weight EMA (both objectives) ---
+    use_ema: bool = False
+    ema_decay: float = 0.9999
 
     # Training preset. ACT's 1e-5 is tuned for an L1 target; a velocity/noise target is a
     # harder regression and the DiT literature runs an order of magnitude higher.
@@ -113,6 +128,8 @@ class ACTDiTConfig(ACTConfig):
                 raise ValueError(
                     f"`prediction_type` must be 'epsilon' or 'sample', got {self.prediction_type!r}."
                 )
+        if self.use_ema and not 0.0 < self.ema_decay < 1.0:
+            raise ValueError(f"`ema_decay` must be in (0, 1), got {self.ema_decay}.")
         if self.use_vae:
             raise ValueError(
                 "`use_vae=True` is not supported by act_dit: the flow/diffusion objective already "

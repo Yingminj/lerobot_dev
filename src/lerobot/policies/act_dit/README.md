@@ -319,7 +319,8 @@ in the conditioning route, with parameter counts within 3 % of each other.
 
 ```bash
 lerobot-train --policy.type=act_dit --dataset.repo_id=... \
-  --policy.objective=flow_matching --policy.num_integration_steps=10
+  --policy.objective=flow_matching --policy.num_integration_steps=10 \
+  --policy.use_ema=true --policy.ema_decay=0.9999
 ```
 
 ---
@@ -345,4 +346,14 @@ lerobot-train --policy.type=act_dit --dataset.repo_id=... \
   execution horizon or temporal ensembling; those remain mutually exclusive as in ACT.
 - **`use_vae=True` is refused** — the flow/diffusion objective already models the action
   distribution, so a CVAE latent would be a second, unused one. Use `act` if you want it.
+- **`use_ema` is off by default and cannot be switched on mid-run.** The shadow weights are
+  registered buffers, so they ride in `model.safetensors` (checkpoint ~2x) and resume for free -
+  but an existing checkpoint has no `ema.*` keys and fails a strict load. `ema_decay=0.9999` is a
+  ~10k-step horizon, sized for runs of 100k+; use 0.999 below ~20k steps. The EMA is driven by
+  `policy.update()`, which only `lerobot_train.py` calls - the RL path in `rl/learner.py` does
+  not, so it trains without EMA regardless of the flag. **Single-device / DDP only**: under FSDP
+  the parameters are shards and the eval-time swap would splice them.
+- **EMA is not visible in the loss.** `eval_loss` improves partly because averaging is smoother,
+  not because rollouts are better. Judging it needs success rates, and the effect is typically
+  smaller than the spread between two seeds.
 - **Diffusion mode needs `diffusers`** (imported via `multi_task_dit`); flow matching does not.

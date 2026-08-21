@@ -52,6 +52,73 @@ from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from .configuration_act_dit import ACTDiTConfig
 
 
+class ACTDiTWeightEMA(nn.Module):
+    """Shadow copy of a module's trainable weights, swapped in whenever the policy is in eval mode.
+
+    Lives inside the policy rather than in `lerobot_train.py` for three reasons: the trainer
+    already calls `policy.update()` after every optimizer step (that hook is unused by
+    `ACTPolicy`), the shadow rides in the policy's own `state_dict` so save and resume need no
+    plumbing, and the scope stays the policy's business - a trainer-level averager would have to
+    guess which parameters are frozen.
+
+    The shadow is registered as buffers, so it moves with `.to(device)`, is written into
+    `model.safetensors`, and comes back on resume. Two consequences: the checkpoint is ~2x, and
+    flipping `use_ema` on mid-run makes an existing checkpoint fail a strict load.
+
+    ponytail: dense single-device / DDP only. Under FSDP the parameters are shards, so the swap
+    would splice shards together; guard `use_ema` off there rather than trusting this.
+    """
+
+    def __init__(self, model: nn.Module, decay: float):
+        super().__init__()
+        self.decay = decay
+        # Frozen parameters are excluded at construction: averaging a constant is a copy, and it
+        # would be paid for in checkpoint size. A parameter frozen *later* keeps being averaged.
+        self._names = [n for n, p in model.named_parameters() if p.requires_grad]
+        for name in self._names:
+            # `register_buffer` rejects "." in a name; the module tree is flattened here anyway.
+            self.register_buffer(name.replace(".", "/"), model.get_parameter(name).detach().clone())
+        self.register_buffer("num_updates", torch.zeros((), dtype=torch.long))
+        self._live: list[Tensor] | None = None  # live weights parked while the shadow is active
+
+    def _pairs(self, model: nn.Module) -> tuple[list[Tensor], list[Tensor]]:
+        """(shadow, live) tensors, re-resolved every call so a `.to()` between steps is followed."""
+        params = dict(model.named_parameters())
+        return (
+            [self.get_buffer(n.replace(".", "/")) for n in self._names],
+            [params[n] for n in self._names],
+        )
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        if self._live is not None:
+            raise RuntimeError("EMA update while the shadow is swapped in - the policy is in eval mode.")
+        self.num_updates += 1
+        n = int(self.num_updates)
+        # Warmup ramp: a cold shadow averaged at 0.9999 would trail the weights for the first
+        # ~10k steps. `(1+n)/(10+n)` starts near 0.2 and reaches the configured decay quickly.
+        decay = min(self.decay, (1.0 + n) / (10.0 + n))
+        shadow, live = self._pairs(model)
+        torch._foreach_lerp_(shadow, live, 1.0 - decay)
+
+    @torch.no_grad()
+    def set_active(self, model: nn.Module, active: bool) -> None:
+        """Swap the shadow in (`active`) or restore the live weights. Idempotent: the training
+        loop calls `policy.train()` every step, and `select_action` calls `policy.eval()` on
+        every call, so this has to be free when the state already matches."""
+        if active == (self._live is not None):
+            return
+        shadow, live = self._pairs(model)
+        if active:
+            self._live = [p.detach().clone() for p in live]
+            for p, s in zip(live, shadow, strict=True):
+                p.data.copy_(s)
+        else:
+            for p, saved in zip(live, self._live, strict=True):
+                p.data.copy_(saved)
+            self._live = None
+
+
 class ACTDiTPolicy(ACTPolicy):
     """ACT with a flow-matching / diffusion decoder.
 
@@ -78,6 +145,32 @@ class ACTDiTPolicy(ACTPolicy):
             horizon=config.chunk_size,
             do_mask_loss_for_padding=True,
         )
+
+        # Submodules live in `nn.Module._modules` and are reached through `__getattr__`, which
+        # only fires when normal lookup fails - so this must not be shadowed by a class attribute.
+        self.ema = ACTDiTWeightEMA(self.model, config.ema_decay) if config.use_ema else None
+
+    def update(self) -> None:
+        """EMA step. Called by `lerobot_train.py` after every optimizer step, via the
+        `has_method(policy, "update")` hook - `ACTPolicy` defines no `update`, so this is the
+        whole contract. Note `rl/learner.py` never calls it; the RL path gets no EMA."""
+        if self.ema is not None:
+            self.ema.update(self.model)
+
+    def train(self, mode: bool = True):
+        """Sample from the averaged weights whenever the policy is not training.
+
+        This covers eval loss (the loop toggles `eval()`/`train()` around it) and deployment
+        (`ACTPolicy.select_action` calls `self.eval()` on every call, and `from_pretrained`
+        ends with one) without either caller knowing about EMA. Checkpoints are written in
+        train mode, so `model.safetensors` holds the live weights; a resumed policy arrives in
+        eval mode and its first `update_policy` step swaps them back in."""
+        # `getattr`: `nn.Module.__init__` machinery may toggle training mode before the
+        # assignment in `__init__` above has run.
+        ema = getattr(self, "ema", None)
+        if ema is not None:
+            ema.set_active(self.model, active=not mode)
+        return super().train(mode)
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.config.image_features:

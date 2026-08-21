@@ -6,7 +6,8 @@ Covers the three things that break silently:
      ~25 lines of `ACT.forward` so that `act/modeling_act.py` stays untouched),
   2. the encoder runs ONCE per chunk while the decoder runs once per integration step
      (the whole cost argument of S1 rests on this),
-  3. both conditioning arms train: with cross-attention (S1) and without (ablation D).
+  3. both conditioning arms train: with cross-attention (S1) and without (ablation D),
+  4. the weight EMA tracks the live weights and swaps in/out of eval mode losslessly.
 """
 
 import torch
@@ -142,6 +143,61 @@ def test_adaln_starts_as_identity():
     for layer in policy.model.decoder.layers:
         assert layer.adaln[-1].weight.abs().sum() == 0
         assert layer.adaln[-1].bias.abs().sum() == 0
+
+
+def test_ema_tracks_and_swaps():
+    """EMA moves toward the live weights, is used in eval mode, and restores them exactly."""
+    torch.manual_seed(0)
+    # decay=0.5 so one update makes a visible move; the warmup ramp makes step 1 even faster.
+    policy = ACTDiTPolicy(_act_config(ACTDiTConfig, use_ema=True, ema_decay=0.5))
+    name = "action_in_proj.weight"
+    param = policy.model.get_parameter(name)
+    shadow = policy.ema.get_buffer(name.replace(".", "/"))
+
+    assert torch.equal(shadow, param), "shadow starts as a copy of the weights"
+
+    with torch.no_grad():  # stand in for an optimizer step
+        param.add_(1.0)
+    before = shadow.clone()
+    policy.update()
+    assert not torch.equal(shadow, before), "EMA did not move"
+    assert not torch.equal(shadow, param), "EMA jumped straight to the live weights"
+    assert ((shadow - before).sign() == (param - before).sign()).all(), "EMA moved the wrong way"
+
+    live = param.detach().clone()
+    policy.eval()
+    assert torch.equal(param, shadow), "eval mode must sample from the EMA weights"
+    policy.eval()  # idempotent: select_action calls eval() on every single call
+    assert torch.equal(param, shadow)
+    policy.train()
+    assert torch.equal(param, live), "train mode must restore the live weights bit-exactly"
+
+    # The shadow rides in the state dict, so resume needs no plumbing in the training loop.
+    assert f"ema.{name.replace('.', '/')}" in policy.state_dict()
+
+    # An EMA step while swapped in would average the shadow into itself.
+    policy.eval()
+    try:
+        policy.update()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("update() must refuse to run while the shadow is swapped in")
+    policy.train()
+
+
+def test_ema_off_by_default():
+    policy = ACTDiTPolicy(_act_config(ACTDiTConfig))
+    assert policy.ema is None
+    policy.update()  # the trainer calls this unconditionally; it must be a no-op
+    assert not any(k.startswith("ema.") for k in policy.state_dict())
+
+    try:
+        _act_config(ACTDiTConfig, use_ema=True, ema_decay=1.0)
+    except ValueError as e:
+        assert "ema_decay" in str(e)
+    else:
+        raise AssertionError("ema_decay=1.0 should be refused")
 
 
 def test_vae_is_refused():
