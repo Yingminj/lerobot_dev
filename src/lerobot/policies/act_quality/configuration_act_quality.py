@@ -49,6 +49,10 @@ class ACTQualityConfig(ACTConfig):
     quality_zero_masked_vae_actions: bool = True
     quality_balance_anchor_pools: bool = True
     quality_recovery_anchor_fraction: float = 0.25
+    # Fractions are measured against the complete sampler epoch. The onset
+    # quota is part of (not additional to) quality_recovery_anchor_fraction.
+    quality_recovery_onset_steps: int = 30
+    quality_recovery_onset_fraction: float = 0.10
     quality_balanced_epoch_size: int = 0
 
     def __post_init__(self) -> None:
@@ -58,6 +62,23 @@ class ACTQualityConfig(ACTConfig):
         if not 0.0 <= self.quality_recovery_anchor_fraction <= 1.0:
             raise ValueError(
                 "`quality_recovery_anchor_fraction` must be in [0, 1], got "
+                f"{self.quality_recovery_anchor_fraction}."
+            )
+        if self.quality_recovery_onset_steps <= 0:
+            raise ValueError(
+                "`quality_recovery_onset_steps` must be > 0, got "
+                f"{self.quality_recovery_onset_steps}."
+            )
+        if not 0.0 <= self.quality_recovery_onset_fraction <= 1.0:
+            raise ValueError(
+                "`quality_recovery_onset_fraction` must be in [0, 1], got "
+                f"{self.quality_recovery_onset_fraction}."
+            )
+        if self.quality_recovery_onset_fraction > self.quality_recovery_anchor_fraction:
+            raise ValueError(
+                "`quality_recovery_onset_fraction` is part of the total recovery quota and "
+                "must be <= `quality_recovery_anchor_fraction`, got "
+                f"{self.quality_recovery_onset_fraction} > "
                 f"{self.quality_recovery_anchor_fraction}."
             )
         if self.quality_balanced_epoch_size < 0:
@@ -88,9 +109,10 @@ class ACTQualityConfig(ACTConfig):
         else:
             dtype = str(feature.get("dtype"))
             shape = tuple(feature.get("shape", ()))
-            if dtype != "bool" or shape != (1,):
+            if dtype not in {"bool", "int64"} or shape != (1,):
                 raise ValueError(
-                    f"Quality feature {self.quality_label_key!r} must have dtype=bool and "
+                    f"Quality feature {self.quality_label_key!r} must have dtype=bool or "
+                    "dtype=int64 and "
                     f"shape=(1,), got dtype={dtype!r}, shape={shape!r}."
                 )
 

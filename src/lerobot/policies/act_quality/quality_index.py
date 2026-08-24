@@ -35,13 +35,19 @@ from lerobot.datasets import EpisodeAwareSampler
 if TYPE_CHECKING:
     from lerobot.datasets import LeRobotDatasetMetadata
 
+QUALITY_INVALID = 0
+QUALITY_NORMAL = 1
+QUALITY_RECOVERY = 2
+
 
 @dataclass(frozen=True)
 class QualitySamplingConfig:
-    """Runtime-only controls for normal/recovery anchor-pool sampling."""
+    """Runtime-only controls for normal/onset/remainder anchor sampling."""
 
     balance_anchor_pools: bool = False
     recovery_anchor_fraction: float = 0.25
+    recovery_onset_steps: int = 30
+    recovery_onset_fraction: float = 0.10
     balanced_epoch_size: int = 0
 
 
@@ -72,7 +78,12 @@ class _AnchorPool:
 
 @dataclass(frozen=True)
 class QualityIndex:
-    """Dense quality lookup indexed by the dataset's absolute ``index`` field."""
+    """Dense canonical 0/1/2 labels indexed by absolute dataset frame index.
+
+    Bool datasets are upgraded in memory using manifest episode provenance:
+    False becomes 0, normal True becomes 1, and recovery True becomes 2.
+    Ternary datasets are already stored in this canonical representation.
+    """
 
     labels: torch.Tensor
     episode_from_indices: torch.Tensor
@@ -81,8 +92,17 @@ class QualityIndex:
     label_key: str
     recovery_episode_flags: torch.Tensor | None = None
 
+    def valid_frame_mask(self) -> torch.Tensor:
+        return self.labels != QUALITY_INVALID
+
+    def normal_frame_mask(self) -> torch.Tensor:
+        return self.labels == QUALITY_NORMAL
+
+    def recovery_frame_mask(self) -> torch.Tensor:
+        return self.labels == QUALITY_RECOVERY
+
     def recovery_episode_mask(self) -> torch.Tensor:
-        """Return episode provenance, falling back to detectable invalid prefixes."""
+        """Return episode provenance, falling back to canonical label value 2."""
         if self.recovery_episode_flags is not None:
             if self.recovery_episode_flags.shape != self.episode_from_indices.shape:
                 raise ValueError(
@@ -91,9 +111,16 @@ class QualityIndex:
                     f"{tuple(self.episode_from_indices.shape)}."
                 )
             return self.recovery_episode_flags.bool()
-        return (self.first_valid_indices > self.episode_from_indices) & (
-            self.first_valid_indices < self.episode_to_indices
-        )
+        flags = torch.zeros_like(self.episode_from_indices, dtype=torch.bool)
+        for position, (start, stop) in enumerate(
+            zip(
+                self.episode_from_indices.tolist(),
+                self.episode_to_indices.tolist(),
+                strict=True,
+            )
+        ):
+            flags[position] = bool((self.labels[start:stop] == QUALITY_RECOVERY).any())
+        return flags
 
     @property
     def total_frames(self) -> int:
@@ -105,7 +132,7 @@ class QualityIndex:
 
     @property
     def invalid_frames(self) -> int:
-        return int((~self.labels).sum().item())
+        return int((self.labels == QUALITY_INVALID).sum().item())
 
     @property
     def invalid_anchor_frames(self) -> int:
@@ -147,7 +174,13 @@ class QualityIndex:
 
     def recovery_anchor_mask(self) -> torch.Tensor:
         """Return a dense mask that is True only on valid recovery-suffix anchors."""
-        mask = torch.zeros_like(self.labels)
+        return self.recovery_frame_mask()
+
+    def recovery_onset_anchor_mask(self, onset_steps: int) -> torch.Tensor:
+        """Return the first ``onset_steps`` valid anchors of each recovery episode."""
+        if onset_steps <= 0:
+            raise ValueError(f"onset_steps must be > 0, got {onset_steps}.")
+        mask = torch.zeros(self.total_frames, dtype=torch.bool)
         for is_recovery, first_valid, stop in zip(
             self.recovery_episode_mask().tolist(),
             self.first_valid_indices.tolist(),
@@ -155,7 +188,7 @@ class QualityIndex:
             strict=True,
         ):
             if is_recovery and first_valid < stop:
-                mask[first_valid:stop] = True
+                mask[first_valid : min(first_valid + onset_steps, stop)] = True
         return mask
 
     @classmethod
@@ -166,33 +199,36 @@ class QualityIndex:
         *,
         require_monotonic: bool = True,
     ) -> QualityIndex:
-        """Read the scalar label from every data parquet and validate alignment."""
+        """Read bool or ternary labels, canonicalize to 0/1/2, and validate."""
         feature = dataset_meta.features.get(label_key)
         if feature is None:
             raise ValueError(f"Dataset is missing required quality feature {label_key!r}.")
-        if str(feature.get("dtype")) != "bool" or tuple(feature.get("shape", ())) != (1,):
+        label_dtype = str(feature.get("dtype"))
+        if label_dtype not in {"bool", "int64"} or tuple(feature.get("shape", ())) != (1,):
             raise ValueError(
-                f"Quality feature {label_key!r} must be scalar bool, got {feature!r}."
+                f"Quality feature {label_key!r} must be scalar bool or int64, got {feature!r}."
             )
+        is_legacy_bool = label_dtype == "bool"
 
         total_frames = int(dataset_meta.total_frames)
-        labels = torch.empty(total_frames, dtype=torch.bool)
+        raw_labels = torch.empty(total_frames, dtype=torch.long)
         seen = torch.zeros(total_frames, dtype=torch.bool)
         parquet_paths = sorted((Path(dataset_meta.root) / "data").rglob("*.parquet"))
         if not parquet_paths:
             raise FileNotFoundError(f"No data parquet found below {Path(dataset_meta.root) / 'data'}.")
 
         for parquet_path in parquet_paths:
-            schema_names = pq.read_schema(parquet_path).names
+            parquet = pq.ParquetFile(parquet_path)
+            schema_names = parquet.schema_arrow.names
             if label_key not in schema_names:
                 raise ValueError(f"Parquet is missing {label_key!r}: {parquet_path}")
-            table = pq.read_table(parquet_path, columns=["index", label_key])
+            table = parquet.read(columns=["index", label_key])
             if table.column(label_key).null_count:
                 raise ValueError(f"Quality label contains null values: {parquet_path}")
             indices_np = table.column("index").to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-            labels_np = table.column(label_key).to_numpy(zero_copy_only=False).astype(np.bool_, copy=False)
+            labels_np = table.column(label_key).to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
             indices = torch.from_numpy(np.array(indices_np, copy=True))
-            shard_labels = torch.from_numpy(np.array(labels_np, copy=True))
+            shard_labels = torch.from_numpy(np.array(labels_np, copy=True)).long()
 
             if indices.numel() != torch.unique(indices).numel():
                 raise ValueError(f"Duplicate index values inside parquet: {parquet_path}")
@@ -203,7 +239,7 @@ class QualityIndex:
             if seen[indices].any():
                 duplicate = int(indices[seen[indices]][0])
                 raise ValueError(f"Duplicate dataset index {duplicate} across parquet files.")
-            labels[indices] = shard_labels
+            raw_labels[indices] = shard_labels
             seen[indices] = True
 
         if not seen.all():
@@ -211,6 +247,17 @@ class QualityIndex:
             raise ValueError(
                 f"Quality index is incomplete: {missing.numel()} frame(s) are missing; "
                 f"first missing index={int(missing[0])}."
+            )
+        allowed_values = {QUALITY_INVALID, QUALITY_NORMAL} if is_legacy_bool else {
+            QUALITY_INVALID,
+            QUALITY_NORMAL,
+            QUALITY_RECOVERY,
+        }
+        actual_values = set(raw_labels.unique().tolist())
+        if not actual_values <= allowed_values:
+            raise ValueError(
+                f"Quality labels contain unsupported values {sorted(actual_values)}; "
+                f"expected {sorted(allowed_values)} for dtype={label_dtype}."
             )
 
         episode_from = torch.as_tensor(
@@ -221,22 +268,6 @@ class QualityIndex:
         )
         if episode_from.numel() != episode_to.numel():
             raise ValueError("Episode metadata has mismatched from/to index arrays.")
-
-        first_valid = episode_to.clone()
-        for episode_pos, (start, stop) in enumerate(
-            zip(episode_from.tolist(), episode_to.tolist(), strict=True)
-        ):
-            segment = labels[start:stop]
-            if segment.numel() == 0:
-                raise ValueError(f"Episode position {episode_pos} has no frames.")
-            if require_monotonic and segment.numel() > 1 and (segment[:-1] & ~segment[1:]).any():
-                raise ValueError(
-                    f"Episode position {episode_pos} has a True->False quality transition. "
-                    "act_quality expects one invalid prefix followed by one valid suffix."
-                )
-            valid_offsets = torch.nonzero(segment, as_tuple=False).flatten()
-            if valid_offsets.numel():
-                first_valid[episode_pos] = start + valid_offsets[0]
 
         manifest_path = Path(dataset_meta.root) / "meta" / "quality_label_manifest.json"
         if manifest_path.is_file():
@@ -251,6 +282,7 @@ class QualityIndex:
             if not isinstance(selections, dict):
                 raise ValueError(f"Quality manifest has no selections object: {manifest_path}")
             recovery_episode_flags = torch.zeros(episode_from.numel(), dtype=torch.bool)
+            manifest_boundaries: dict[int, int] = {}
             for raw_position, selection in selections.items():
                 position = int(raw_position)
                 if not 0 <= position < episode_from.numel():
@@ -269,18 +301,9 @@ class QualityIndex:
                 start = int(episode_from[position])
                 stop = int(episode_to[position])
                 if selection["kind"] == "recovery":
-                    expected_first_valid = start + int(selection["recovery_start_frame"])
-                    if int(first_valid[position]) != expected_first_valid:
-                        raise ValueError(
-                            f"Quality manifest recovery boundary for episode position {position} "
-                            f"is {expected_first_valid}, but parquet labels start at "
-                            f"{int(first_valid[position])}."
-                        )
-                elif not labels[start:stop].all():
-                    raise ValueError(
-                        f"Quality manifest marks episode position {position} all_valid, but its "
-                        "parquet labels contain False."
-                    )
+                    manifest_boundaries[position] = start + int(selection["recovery_start_frame"])
+                else:
+                    manifest_boundaries[position] = start
             expected_recovery_count = manifest.get("recovery_candidate_count")
             if expected_recovery_count is not None and int(expected_recovery_count) != int(
                 recovery_episode_flags.sum()
@@ -295,13 +318,97 @@ class QualityIndex:
                 manifest_path,
             )
         else:
-            recovery_episode_flags = (first_valid > episode_from) & (first_valid < episode_to)
-            logging.warning(
-                "[act_quality] %s is absent; recovery episodes are inferred only from False "
-                "prefixes. All-valid recovery episodes cannot be distinguished from normal "
-                "success episodes.",
-                manifest_path,
+            manifest_boundaries = {}
+            if is_legacy_bool:
+                recovery_episode_flags = torch.zeros(episode_from.numel(), dtype=torch.bool)
+                for position, (start, stop) in enumerate(
+                    zip(episode_from.tolist(), episode_to.tolist(), strict=True)
+                ):
+                    segment = raw_labels[start:stop]
+                    recovery_episode_flags[position] = bool(
+                        (segment == QUALITY_INVALID).any() and (segment == QUALITY_NORMAL).any()
+                    )
+                logging.warning(
+                    "[act_quality] %s is absent; bool recovery episodes are inferred only from "
+                    "0-prefix/1-suffix patterns. All-valid recovery recordings are "
+                    "indistinguishable from normal success.",
+                    manifest_path,
+                )
+            else:
+                recovery_episode_flags = torch.zeros(episode_from.numel(), dtype=torch.bool)
+                for position, (start, stop) in enumerate(
+                    zip(episode_from.tolist(), episode_to.tolist(), strict=True)
+                ):
+                    recovery_episode_flags[position] = bool(
+                        (raw_labels[start:stop] == QUALITY_RECOVERY).any()
+                    )
+                logging.info(
+                    "[act_quality] %s is absent; ternary recovery provenance is inferred from "
+                    "label value 2.",
+                    manifest_path,
+                )
+
+        # Canonical in-memory representation is always 0/1/2. This lets old
+        # bool datasets use the same three-pool sampler without rewriting them.
+        if is_legacy_bool:
+            labels = torch.zeros_like(raw_labels)
+            for is_recovery, start, stop in zip(
+                recovery_episode_flags.tolist(),
+                episode_from.tolist(),
+                episode_to.tolist(),
+                strict=True,
+            ):
+                valid = raw_labels[start:stop] != QUALITY_INVALID
+                segment = labels[start:stop]
+                segment[valid] = QUALITY_RECOVERY if is_recovery else QUALITY_NORMAL
+        else:
+            labels = raw_labels.clone()
+
+        first_valid = episode_to.clone()
+        for episode_pos, (start, stop, is_recovery) in enumerate(
+            zip(
+                episode_from.tolist(),
+                episode_to.tolist(),
+                recovery_episode_flags.tolist(),
+                strict=True,
             )
+        ):
+            segment = labels[start:stop]
+            if segment.numel() == 0:
+                raise ValueError(f"Episode position {episode_pos} has no frames.")
+            valid = segment != QUALITY_INVALID
+            valid_offsets = torch.nonzero(valid, as_tuple=False).flatten()
+            if valid_offsets.numel():
+                first_valid[episode_pos] = start + valid_offsets[0]
+            if not require_monotonic:
+                continue
+            if valid.numel() > 1 and (valid[:-1] & ~valid[1:]).any():
+                raise ValueError(
+                    f"Episode position {episode_pos} has a valid->invalid transition; expected "
+                    "one invalid prefix followed by one valid suffix."
+                )
+            expected_value = QUALITY_RECOVERY if is_recovery else QUALITY_NORMAL
+            unexpected = segment[valid] != expected_value
+            if unexpected.any():
+                raise ValueError(
+                    f"Episode position {episode_pos} is classified as "
+                    f"{'recovery' if is_recovery else 'normal'} but its valid suffix contains "
+                    f"labels {sorted(set(segment[valid].tolist()))}; expected only "
+                    f"{expected_value}."
+                )
+            if not is_recovery and not valid.all():
+                raise ValueError(
+                    f"Normal episode position {episode_pos} contains label 0; normal episodes "
+                    "must be all 1."
+                )
+
+        for position, expected_first_valid in manifest_boundaries.items():
+            if int(first_valid[position]) != expected_first_valid:
+                raise ValueError(
+                    f"Quality manifest recovery boundary for episode position {position} is "
+                    f"{expected_first_valid}, but parquet labels start at "
+                    f"{int(first_valid[position])}."
+                )
 
         result = cls(
             labels=labels,
@@ -312,10 +419,12 @@ class QualityIndex:
             recovery_episode_flags=recovery_episode_flags,
         )
         logging.info(
-            "[act_quality] loaded %s: %d frames, %d invalid target frames, "
+            "[act_quality] loaded %s (%s -> canonical int64 0/1/2): %d frames, "
+            "%d invalid target frames, "
             "%d invalid anchors, %d normal anchors, %d recovery anchors, "
             "%d normal episodes, %d recovery episodes, %d episodes without valid anchors",
             label_key,
+            label_dtype,
             result.total_frames,
             result.invalid_frames,
             result.invalid_anchor_frames,
@@ -337,12 +446,22 @@ def activate_quality_index(
     *,
     balance_anchor_pools: bool = False,
     recovery_anchor_fraction: float = 0.25,
+    recovery_onset_steps: int = 30,
+    recovery_onset_fraction: float = 0.10,
     balanced_epoch_size: int = 0,
 ) -> None:
     """Make the index and sampling policy available to the train-process hook."""
     if not 0.0 <= recovery_anchor_fraction <= 1.0:
         raise ValueError(
             f"recovery_anchor_fraction must be in [0, 1], got {recovery_anchor_fraction}."
+        )
+    if recovery_onset_steps <= 0:
+        raise ValueError(f"recovery_onset_steps must be > 0, got {recovery_onset_steps}.")
+    if not 0.0 <= recovery_onset_fraction <= recovery_anchor_fraction:
+        raise ValueError(
+            "recovery_onset_fraction must be in [0, recovery_anchor_fraction], got "
+            f"{recovery_onset_fraction} and recovery_anchor_fraction="
+            f"{recovery_anchor_fraction}."
         )
     if balanced_epoch_size < 0:
         raise ValueError(f"balanced_epoch_size must be >= 0, got {balanced_epoch_size}.")
@@ -351,18 +470,21 @@ def activate_quality_index(
     _ACTIVE_SAMPLING_CONFIG = QualitySamplingConfig(
         balance_anchor_pools=balance_anchor_pools,
         recovery_anchor_fraction=recovery_anchor_fraction,
+        recovery_onset_steps=recovery_onset_steps,
+        recovery_onset_fraction=recovery_onset_fraction,
         balanced_epoch_size=balanced_epoch_size,
     )
 
 
 class QualityAwareEpisodeSampler(EpisodeAwareSampler):
-    """Filter invalid anchors and optionally balance normal/recovery anchor pools.
+    """Filter invalid anchors and optionally balance three semantic anchor pools.
 
     Episode provenance comes from ``quality_label_manifest.json`` when present,
     so an all-valid recovery episode stays in the recovery pool. Without that
-    manifest, only episodes with a detectable False prefix can be identified as
-    recovery. The balanced epoch keeps a fixed length and draws an exact quota
-    from each pool, repeating shuffled passes only when a pool is oversampled.
+    manifest, bool labels only identify episodes with a detectable False prefix;
+    ternary labels identify recovery episodes directly through value 2. The
+    balanced epoch draws exact normal, recovery-onset, and recovery-remainder
+    quotas, repeating shuffled passes only when a pool is oversampled.
     """
 
     def __init__(
@@ -413,9 +535,11 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
             starts=np.empty(0, dtype=np.int64),
             cumulative_lengths=np.empty(0, dtype=np.int64),
         )
-        self._recovery_pool = self._normal_pool
+        self._recovery_onset_pool = self._normal_pool
+        self._recovery_remainder_pool = self._normal_pool
         self._normal_samples_per_epoch = 0
-        self._recovery_samples_per_epoch = 0
+        self._recovery_onset_samples_per_epoch = 0
+        self._recovery_remainder_samples_per_epoch = 0
         self._absolute_to_relative_balanced = absolute_to_relative_idx
 
         if not self._balance_anchor_pools:
@@ -432,25 +556,51 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
 
         starts = adjusted_from + drop_n_first_frames
         stops = original_to - drop_n_last_frames
-        lengths = stops - starts
-        usable = used & (lengths > 0)
+        usable = used & (stops > starts)
         recovery_provenance = quality.recovery_episode_mask().numpy()
         normal_episodes = usable & ~recovery_provenance
         recovery_episodes = usable & recovery_provenance
-        self._normal_pool = self._make_pool(starts, lengths, normal_episodes)
-        self._recovery_pool = self._make_pool(starts, lengths, recovery_episodes)
+        onset_stops = np.minimum(
+            stops,
+            quality.first_valid_indices.numpy()
+            + _ACTIVE_SAMPLING_CONFIG.recovery_onset_steps,
+        )
+        remainder_starts = np.maximum(starts, onset_stops)
+        self._normal_pool = self._make_interval_pool(starts, stops, normal_episodes)
+        self._recovery_onset_pool = self._make_interval_pool(
+            starts,
+            onset_stops,
+            recovery_episodes & (onset_stops > starts),
+        )
+        self._recovery_remainder_pool = self._make_interval_pool(
+            remainder_starts,
+            stops,
+            recovery_episodes & (stops > remainder_starts),
+        )
 
         natural_epoch_size = len(self)
         epoch_size = _ACTIVE_SAMPLING_CONFIG.balanced_epoch_size or natural_epoch_size
         recovery_samples = int(
             np.floor(epoch_size * _ACTIVE_SAMPLING_CONFIG.recovery_anchor_fraction + 0.5)
         )
+        recovery_onset_samples = int(
+            np.floor(epoch_size * _ACTIVE_SAMPLING_CONFIG.recovery_onset_fraction + 0.5)
+        )
+        recovery_onset_samples = min(recovery_onset_samples, recovery_samples)
+        recovery_remainder_samples = recovery_samples - recovery_onset_samples
         normal_samples = epoch_size - recovery_samples
-        if recovery_samples and self._recovery_pool.size == 0:
+        if recovery_onset_samples and self._recovery_onset_pool.size == 0:
             raise ValueError(
-                "Balanced sampling requested recovery anchors, but no recovery anchor remains "
+                "Balanced sampling requested recovery-onset anchors, but no onset anchor remains "
                 "after episode selection and frame dropping. Set "
-                "`quality_recovery_anchor_fraction=0` or fix the labels."
+                "`quality_recovery_onset_fraction=0` or fix the labels."
+            )
+        if recovery_remainder_samples and self._recovery_remainder_pool.size == 0:
+            raise ValueError(
+                "Balanced sampling requested recovery-remainder anchors, but no remainder anchor "
+                "remains after episode selection and frame dropping. Set "
+                "`quality_recovery_onset_fraction=quality_recovery_anchor_fraction`, reduce "
+                "`quality_recovery_onset_steps`, or add longer recovery suffixes."
             )
         if normal_samples and self._normal_pool.size == 0:
             raise ValueError(
@@ -460,31 +610,46 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
             )
 
         self._normal_samples_per_epoch = normal_samples
-        self._recovery_samples_per_epoch = recovery_samples
+        self._recovery_onset_samples_per_epoch = recovery_onset_samples
+        self._recovery_remainder_samples_per_epoch = recovery_remainder_samples
         self._num_frames = epoch_size
-        effective_fraction = recovery_samples / epoch_size
         normal_repeat = normal_samples / self._normal_pool.size if self._normal_pool.size else 0.0
-        recovery_repeat = (
-            recovery_samples / self._recovery_pool.size if self._recovery_pool.size else 0.0
+        onset_repeat = (
+            recovery_onset_samples / self._recovery_onset_pool.size
+            if self._recovery_onset_pool.size
+            else 0.0
+        )
+        remainder_repeat = (
+            recovery_remainder_samples / self._recovery_remainder_pool.size
+            if self._recovery_remainder_pool.size
+            else 0.0
         )
         logging.info(
-            "[act_quality] balanced anchor pools: normal_unique=%d, recovery_unique=%d, "
-            "epoch_size=%d, normal_samples=%d, recovery_samples=%d (%.2f%%), "
-            "normal_sampling_factor=%.3fx, recovery_sampling_factor=%.3fx",
+            "[act_quality] balanced anchor pools: normal_unique=%d, onset_unique=%d, "
+            "remainder_unique=%d, epoch_size=%d, normal_samples=%d (%.2f%%), "
+            "onset_samples=%d (%.2f%%), remainder_samples=%d (%.2f%%), "
+            "sampling_factors=normal %.3fx/onset %.3fx/remainder %.3fx",
             self._normal_pool.size,
-            self._recovery_pool.size,
+            self._recovery_onset_pool.size,
+            self._recovery_remainder_pool.size,
             epoch_size,
             normal_samples,
-            recovery_samples,
-            100.0 * effective_fraction,
+            100.0 * normal_samples / epoch_size,
+            recovery_onset_samples,
+            100.0 * recovery_onset_samples / epoch_size,
+            recovery_remainder_samples,
+            100.0 * recovery_remainder_samples / epoch_size,
             normal_repeat,
-            recovery_repeat,
+            onset_repeat,
+            remainder_repeat,
         )
 
     @staticmethod
-    def _make_pool(starts: np.ndarray, lengths: np.ndarray, selected: np.ndarray) -> _AnchorPool:
+    def _make_interval_pool(
+        starts: np.ndarray, stops: np.ndarray, selected: np.ndarray
+    ) -> _AnchorPool:
         selected_starts = starts[selected].astype(np.int64, copy=False)
-        selected_lengths = lengths[selected].astype(np.int64, copy=False)
+        selected_lengths = (stops[selected] - starts[selected]).astype(np.int64, copy=False)
         return _AnchorPool(
             starts=selected_starts,
             cumulative_lengths=np.cumsum(selected_lengths, dtype=np.int64),
@@ -496,7 +661,15 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
 
     @property
     def recovery_pool_size(self) -> int:
-        return self._recovery_pool.size
+        return self.recovery_onset_pool_size + self.recovery_remainder_pool_size
+
+    @property
+    def recovery_onset_pool_size(self) -> int:
+        return self._recovery_onset_pool.size
+
+    @property
+    def recovery_remainder_pool_size(self) -> int:
+        return self._recovery_remainder_pool.size
 
     @property
     def normal_samples_per_epoch(self) -> int:
@@ -504,7 +677,18 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
 
     @property
     def recovery_samples_per_epoch(self) -> int:
-        return self._recovery_samples_per_epoch
+        return (
+            self._recovery_onset_samples_per_epoch
+            + self._recovery_remainder_samples_per_epoch
+        )
+
+    @property
+    def recovery_onset_samples_per_epoch(self) -> int:
+        return self._recovery_onset_samples_per_epoch
+
+    @property
+    def recovery_remainder_samples_per_epoch(self) -> int:
+        return self._recovery_remainder_samples_per_epoch
 
     @property
     def indices(self) -> list[int]:
@@ -532,25 +716,18 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
         return torch.cat(parts)
 
     @staticmethod
-    def _interleave_without_shuffle(
-        normal: torch.Tensor, recovery: torch.Tensor
-    ) -> torch.Tensor:
-        total = normal.numel() + recovery.numel()
-        if total == 0:
+    def _interleave_without_shuffle(*groups: torch.Tensor) -> torch.Tensor:
+        """Distribute any number of ordered groups approximately uniformly."""
+        nonempty = [group for group in groups if group.numel()]
+        if not nonempty:
             return torch.empty(0, dtype=torch.long)
-        result = torch.empty(total, dtype=torch.long)
-        normal_pos = 0
-        recovery_pos = 0
-        for output_pos in range(total):
-            recovery_before = output_pos * recovery.numel() // total
-            recovery_after = (output_pos + 1) * recovery.numel() // total
-            if recovery_after > recovery_before:
-                result[output_pos] = recovery[recovery_pos]
-                recovery_pos += 1
-            else:
-                result[output_pos] = normal[normal_pos]
-                normal_pos += 1
-        return result
+        priorities = [
+            (torch.arange(group.numel(), dtype=torch.float64) + 0.5) / group.numel()
+            for group in nonempty
+        ]
+        combined = torch.cat(nonempty)
+        order = torch.argsort(torch.cat(priorities), stable=True)
+        return combined[order]
 
     def _balanced_epoch_indices(self, epoch: int) -> torch.Tensor:
         generator = self._epoch_generator(epoch)
@@ -560,18 +737,31 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
             generator=generator,
             shuffle=self.shuffle,
         )
-        recovery_positions = self._sample_pool_positions(
-            self._recovery_pool.size,
-            self._recovery_samples_per_epoch,
+        onset_positions = self._sample_pool_positions(
+            self._recovery_onset_pool.size,
+            self._recovery_onset_samples_per_epoch,
+            generator=generator,
+            shuffle=self.shuffle,
+        )
+        remainder_positions = self._sample_pool_positions(
+            self._recovery_remainder_pool.size,
+            self._recovery_remainder_samples_per_epoch,
             generator=generator,
             shuffle=self.shuffle,
         )
         normal_indices = self._normal_pool.absolute_indices(normal_positions)
-        recovery_indices = self._recovery_pool.absolute_indices(recovery_positions)
+        onset_indices = self._recovery_onset_pool.absolute_indices(onset_positions)
+        remainder_indices = self._recovery_remainder_pool.absolute_indices(
+            remainder_positions
+        )
         if self.shuffle:
-            combined = torch.cat((normal_indices, recovery_indices))
+            combined = torch.cat((normal_indices, onset_indices, remainder_indices))
             return combined[torch.randperm(combined.numel(), generator=generator)]
-        return self._interleave_without_shuffle(normal_indices, recovery_indices)
+        return self._interleave_without_shuffle(
+            normal_indices,
+            onset_indices,
+            remainder_indices,
+        )
 
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:
         if not self._balance_anchor_pools:

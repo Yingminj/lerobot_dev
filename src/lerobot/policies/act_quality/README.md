@@ -5,15 +5,16 @@ This package implements recovery-data filtering without editing any file outside
 
 The ACT network architecture and state-dict names are unchanged.  The package adds:
 
-1. a scalar boolean dataset feature (`action_quality` by default);
+1. a scalar ternary dataset feature (`action_quality` by default), with legacy
+   boolean-label compatibility;
 2. a dense read-only lookup from global frame `index` to quality;
-3. a sampler hook that starts every episode at its first `True` frame;
+3. a sampler hook that starts every episode at its first non-zero frame;
 4. a `[B,H]` target mask constructed from the lookup;
 5. the same mask in reconstruction loss and the CVAE key-padding mask;
 6. zeroed invalid action tokens before the CVAE action projection;
 7. valid-element L1 and valid-sample KL renormalization;
-8. separate normal-success and recovery anchor pools with a configurable
-   recovery sampling fraction.
+8. separate normal-success, recovery-onset, and recovery-remainder anchor pools
+   with configurable epoch quotas.
 
 ## ACT configuration inheritance
 
@@ -27,22 +28,42 @@ ACT configurations from silently drifting apart.
 
 ## Required label semantics
 
-For every episode, labels must have one of these forms:
+The preferred dataset dtype is scalar `int64`. For every episode, labels must
+have one of these forms:
 
 ```text
-1 1 1 1 ...       # normal demonstration
-0 0 0 1 1 1 ...   # invalid prefix, valid recovery suffix
+1 1 1 1 ...       # normal-success episode
+0 0 0 2 2 2 ...   # invalid mistake prefix, valid recovery suffix
 ```
 
-`True -> False` transitions are rejected by default.  This validation is what
-allows the sampler to skip an entire invalid prefix efficiently.
+The meanings are:
+
+- `0`: invalid target/anchor; excluded from reconstruction loss, CVAE action
+  encoding, and the main sampler;
+- `1`: valid normal-success target/anchor;
+- `2`: valid recovery target/anchor.
+
+Labels `1` and `2` use the same reconstruction and KL objectives. Their numeric
+values are never used as loss weights. Value `2` exists to preserve recovery
+provenance after masking so the sampler can split the recovery suffix into its
+first `quality_recovery_onset_steps` anchors and the remaining anchors.
+
+Non-zero-to-zero transitions are rejected by default. Normal episodes must be
+all `1`; recovery episodes must be one `0` prefix followed by one `2` suffix.
+This validation allows the sampler to skip invalid prefixes efficiently.
+
+Legacy scalar `bool` datasets remain supported. They are canonicalized in
+memory to `0/1/2`: manifest-marked recovery `True` frames become `2`, normal
+`True` frames become `1`, and `False` remains `0`. New datasets should use
+ternary `int64`, because it preserves recovery provenance without a manifest.
 
 When `meta/quality_label_manifest.json` is present, its `selections` identify
 recovery episodes, including recovery recordings intentionally labeled
-`all_valid`. Without the manifest, the sampler falls back to treating an
-episode with a non-empty `False` prefix plus a `True` suffix as recovery; in
-that fallback mode an all-valid recovery recording is indistinguishable from a
-normal success. Only valid frames enter either anchor pool.
+`all_valid`. Without the manifest, ternary data identifies recovery episodes
+directly from value `2`. Legacy bool data falls back to a non-empty `False`
+prefix plus a `True` suffix; in that fallback mode an all-valid recovery
+recording is indistinguishable from a normal success. Only non-zero frames enter
+the three valid anchor pools.
 
 ## Train
 
@@ -58,6 +79,8 @@ PYTHONPATH=/home/snorlax/repo/robot_data_platform/lerobot/src \
   --policy.quality_label_key=action_quality \
   --policy.quality_balance_anchor_pools=true \
   --policy.quality_recovery_anchor_fraction=0.25 \
+  --policy.quality_recovery_onset_steps=30 \
+  --policy.quality_recovery_onset_fraction=0.10 \
   --dataset.repo_id=local/my_quality_dataset \
   --dataset.root=/path/to/my_quality_dataset \
   --output_dir=/path/to/output
@@ -69,20 +92,30 @@ generic factory derives `ACTQualityPolicy` from the class name and module path.
 Because the config subclasses `ACTConfig`, the existing factory deliberately routes
 normalization through the upstream ACT processor pipeline.
 
-## Balanced anchor-pool sampling
+## Three-pool anchor sampling
 
 Balanced sampling is enabled by default. `quality_recovery_anchor_fraction`
-controls the exact fraction of recovery anchors in each sampler epoch rather
-than relying on the post-mask natural ratio. The conservative default is
-`0.25`; use `0.5` as a stronger equal-pool ablation.
+controls the exact total fraction of recovery anchors in each sampler epoch.
+`quality_recovery_onset_steps` defines the first `K` valid frames of every
+recovery suffix as onset anchors. `quality_recovery_onset_fraction` controls
+their fraction of the complete epoch and is included inside—not added on top
+of—the total recovery fraction.
+
+With the defaults, each epoch is exactly:
+
+```text
+normal success       75%
+recovery onset       10%   (first 30 valid recovery anchors per episode)
+recovery remainder   15%
+```
 
 `quality_balanced_epoch_size=0` preserves the natural total number of valid
 anchors as the epoch length. A positive value sets an explicit epoch length.
 When a requested pool quota is larger than the number of unique anchors in that
 pool, the sampler repeats independently shuffled full passes through that pool.
-It therefore provides an exact epoch-level ratio while maximizing unique-anchor
-coverage before duplication. Individual minibatches fluctuate around the target
-ratio because the combined epoch is shuffled.
+It therefore provides exact epoch-level three-pool ratios while maximizing
+unique-anchor coverage before duplication. Individual minibatches fluctuate
+around the target ratio because the combined epoch is shuffled.
 
 Useful ablations are:
 
@@ -92,17 +125,20 @@ Useful ablations are:
 
 # Recovery anchors are 25% of each epoch
 --policy.quality_balance_anchor_pools=true \
---policy.quality_recovery_anchor_fraction=0.25
+--policy.quality_recovery_anchor_fraction=0.25 \
+--policy.quality_recovery_onset_steps=30 \
+--policy.quality_recovery_onset_fraction=0.10
 
-# Equal normal/recovery anchor quotas
+# 50% total recovery, of which onset is 20% of the whole epoch
 --policy.quality_balance_anchor_pools=true \
---policy.quality_recovery_anchor_fraction=0.5
+--policy.quality_recovery_anchor_fraction=0.5 \
+--policy.quality_recovery_onset_steps=30 \
+--policy.quality_recovery_onset_fraction=0.2
 ```
 
 The training logs report unique pool sizes, per-epoch quotas, and the effective
-oversampling factor for each pool. Policy metrics also report
-`quality_recovery_anchor_fraction` and `quality_normal_anchor_fraction` for the
-actual minibatch.
+oversampling factor for each pool. Policy metrics also report normal, total
+recovery, recovery-onset, and recovery-remainder fractions for each minibatch.
 
 ## Initialize from an ACT checkpoint
 
@@ -120,13 +156,16 @@ dataset is required.
 
 ## Safety guards
 
-- Missing/non-boolean labels fail before training.
+- Missing labels or labels that are neither scalar bool nor scalar int64 fail
+  before training.
+- Ternary values outside `{0,1,2}` fail before training.
 - Missing, duplicate, out-of-range, or null frame indices fail during policy creation.
 - Dataset/parquet frame alignment is checked exhaustively.
 - Recovery provenance and manifest boundaries are checked against parquet labels.
 - Non-monotonic episode labels fail by default.
 - Invalid anchors are removed by the sampler and independently forced to zero loss.
-- Normal-success and recovery anchors are sampled from separate deterministic pools.
+- Normal, recovery-onset, and recovery-remainder anchors are sampled from
+  separate deterministic pools.
 - Masked actions are zeroed before entering the CVAE encoder.
 - The label lookup is not serialized in model checkpoints.
 

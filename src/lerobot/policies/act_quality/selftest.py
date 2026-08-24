@@ -64,7 +64,7 @@ def _config() -> ACTQualityConfig:
 
 
 def _quality_index() -> QualityIndex:
-    labels = torch.tensor([False, False, True, True, True, True, True, True])
+    labels = torch.tensor([0, 0, 2, 2, 1, 1, 1, 1], dtype=torch.long)
     return QualityIndex(
         labels=labels,
         episode_from_indices=torch.tensor([0, 4]),
@@ -113,14 +113,20 @@ def test_balanced_sampler() -> None:
         quality,
         balance_anchor_pools=True,
         recovery_anchor_fraction=0.5,
+        recovery_onset_steps=1,
+        recovery_onset_fraction=0.25,
     )
     sampler = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=True, seed=7)
     epoch_zero = list(iter(sampler))
     assert len(sampler) == 6
     assert sampler.normal_pool_size == 4
     assert sampler.recovery_pool_size == 2
+    assert sampler.recovery_onset_pool_size == 1
+    assert sampler.recovery_remainder_pool_size == 1
     assert sampler.normal_samples_per_epoch == 3
     assert sampler.recovery_samples_per_epoch == 3
+    assert sampler.recovery_onset_samples_per_epoch == 2
+    assert sampler.recovery_remainder_samples_per_epoch == 1
     assert sum(index < 4 for index in epoch_zero) == 3
     assert sum(index >= 4 for index in epoch_zero) == 3
 
@@ -128,6 +134,8 @@ def test_balanced_sampler() -> None:
         quality,
         balance_anchor_pools=True,
         recovery_anchor_fraction=0.5,
+        recovery_onset_steps=1,
+        recovery_onset_fraction=0.25,
     )
     reproduced = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=True, seed=7)
     assert list(iter(reproduced)) == epoch_zero
@@ -136,6 +144,8 @@ def test_balanced_sampler() -> None:
         quality,
         balance_anchor_pools=True,
         recovery_anchor_fraction=0.5,
+        recovery_onset_steps=1,
+        recovery_onset_fraction=0.25,
     )
     resumed = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=True, seed=7)
     resumed.load_state_dict({"epoch": 0, "start_index": 2})
@@ -144,7 +154,7 @@ def test_balanced_sampler() -> None:
 
 def test_all_valid_recovery_provenance() -> None:
     quality = QualityIndex(
-        labels=torch.ones(8, dtype=torch.bool),
+        labels=torch.tensor([2, 2, 2, 2, 1, 1, 1, 1], dtype=torch.long),
         episode_from_indices=torch.tensor([0, 4]),
         episode_to_indices=torch.tensor([4, 8]),
         first_valid_indices=torch.tensor([0, 4]),
@@ -155,6 +165,8 @@ def test_all_valid_recovery_provenance() -> None:
         quality,
         balance_anchor_pools=True,
         recovery_anchor_fraction=0.5,
+        recovery_onset_steps=1,
+        recovery_onset_fraction=0.25,
     )
     sampler = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=False)
     assert sampler.recovery_pool_size == 4
@@ -229,6 +241,31 @@ def test_parquet_alignment() -> None:
         quality = QualityIndex.from_dataset_meta(meta, "action_quality")
         assert quality.invalid_frames == 2
         assert quality.first_valid_indices.tolist() == [2, 4]
+        assert quality.labels.tolist() == [0, 0, 2, 2, 1, 1, 1, 1]
+
+
+def test_ternary_parquet_alignment() -> None:
+    with tempfile.TemporaryDirectory(prefix="act-quality-ternary-selftest-") as temporary:
+        root = Path(temporary)
+        data_path = root / "data" / "chunk-000" / "file-000.parquet"
+        data_path.parent.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "index": np.arange(8, dtype=np.int64),
+                "action_quality": np.array([0, 0, 2, 2, 1, 1, 1, 1], dtype=np.int64),
+            }
+        ).to_parquet(data_path, index=False)
+        meta = SimpleNamespace(
+            root=root,
+            total_frames=8,
+            features={"action_quality": {"dtype": "int64", "shape": (1,), "names": None}},
+            episodes=pd.DataFrame(
+                {"dataset_from_index": [0, 4], "dataset_to_index": [4, 8]}
+            ),
+        )
+        quality = QualityIndex.from_dataset_meta(meta, "action_quality")
+        assert quality.labels.tolist() == [0, 0, 2, 2, 1, 1, 1, 1]
+        assert quality.recovery_episode_mask().tolist() == [True, False]
 
 
 def main() -> None:
@@ -239,6 +276,7 @@ def main() -> None:
     test_all_valid_recovery_provenance()
     test_masked_forward()
     test_parquet_alignment()
+    test_ternary_parquet_alignment()
     print("act_quality selftest: PASS")
 
 
