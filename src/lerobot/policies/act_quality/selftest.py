@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from dataclasses import fields
 from pathlib import Path
@@ -64,13 +65,17 @@ def _config() -> ACTQualityConfig:
 
 
 def _quality_index() -> QualityIndex:
-    labels = torch.tensor([0, 0, 2, 2, 1, 1, 1, 1], dtype=torch.long)
+    labels = torch.tensor(
+        [0, 0, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1],
+        dtype=torch.long,
+    )
     return QualityIndex(
         labels=labels,
-        episode_from_indices=torch.tensor([0, 4]),
-        episode_to_indices=torch.tensor([4, 8]),
-        first_valid_indices=torch.tensor([2, 4]),
+        episode_from_indices=torch.tensor([0, 6]),
+        episode_to_indices=torch.tensor([6, 12]),
+        first_valid_indices=torch.tensor([2, 6]),
         label_key="action_quality",
+        recovery_episode_flags=torch.tensor([True, False]),
     )
 
 
@@ -103,8 +108,8 @@ def test_upstream_act_compatibility() -> None:
 def test_sampler() -> None:
     quality = _quality_index()
     activate_quality_index(quality)
-    sampler = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=False)
-    assert sampler.indices == [2, 3, 4, 5, 6, 7]
+    sampler = QualityAwareEpisodeSampler([0, 6], [6, 12], shuffle=False)
+    assert sampler.indices == list(range(2, 12))
 
 
 def test_balanced_sampler() -> None:
@@ -116,19 +121,19 @@ def test_balanced_sampler() -> None:
         recovery_onset_steps=1,
         recovery_onset_fraction=0.25,
     )
-    sampler = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=True, seed=7)
+    sampler = QualityAwareEpisodeSampler([0, 6], [6, 12], shuffle=True, seed=7)
     epoch_zero = list(iter(sampler))
-    assert len(sampler) == 6
-    assert sampler.normal_pool_size == 4
+    assert len(sampler) == 10
+    assert sampler.normal_pool_size == 8
     assert sampler.recovery_pool_size == 2
     assert sampler.recovery_onset_pool_size == 1
     assert sampler.recovery_remainder_pool_size == 1
-    assert sampler.normal_samples_per_epoch == 3
-    assert sampler.recovery_samples_per_epoch == 3
-    assert sampler.recovery_onset_samples_per_epoch == 2
-    assert sampler.recovery_remainder_samples_per_epoch == 1
-    assert sum(index < 4 for index in epoch_zero) == 3
-    assert sum(index >= 4 for index in epoch_zero) == 3
+    assert sampler.normal_samples_per_epoch == 5
+    assert sampler.recovery_samples_per_epoch == 5
+    assert sampler.recovery_onset_samples_per_epoch == 3
+    assert sampler.recovery_remainder_samples_per_epoch == 2
+    assert sum(quality.labels[index].item() == 1 for index in epoch_zero) == 5
+    assert sum(quality.labels[index].item() == 2 for index in epoch_zero) == 5
 
     activate_quality_index(
         quality,
@@ -137,7 +142,7 @@ def test_balanced_sampler() -> None:
         recovery_onset_steps=1,
         recovery_onset_fraction=0.25,
     )
-    reproduced = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=True, seed=7)
+    reproduced = QualityAwareEpisodeSampler([0, 6], [6, 12], shuffle=True, seed=7)
     assert list(iter(reproduced)) == epoch_zero
 
     activate_quality_index(
@@ -147,35 +152,35 @@ def test_balanced_sampler() -> None:
         recovery_onset_steps=1,
         recovery_onset_fraction=0.25,
     )
-    resumed = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=True, seed=7)
+    resumed = QualityAwareEpisodeSampler([0, 6], [6, 12], shuffle=True, seed=7)
     resumed.load_state_dict({"epoch": 0, "start_index": 2})
     assert list(iter(resumed)) == epoch_zero[2:]
 
 
-def test_all_valid_recovery_provenance() -> None:
+def test_post_recovery_normal_pool() -> None:
     quality = QualityIndex(
-        labels=torch.tensor([2, 2, 2, 2, 1, 1, 1, 1], dtype=torch.long),
+        labels=torch.tensor([0, 2, 1, 1, 1, 1, 1, 1], dtype=torch.long),
         episode_from_indices=torch.tensor([0, 4]),
         episode_to_indices=torch.tensor([4, 8]),
-        first_valid_indices=torch.tensor([0, 4]),
+        first_valid_indices=torch.tensor([1, 4]),
         label_key="action_quality",
         recovery_episode_flags=torch.tensor([True, False]),
     )
     activate_quality_index(
         quality,
         balance_anchor_pools=True,
-        recovery_anchor_fraction=0.5,
+        recovery_anchor_fraction=0.25,
         recovery_onset_steps=1,
         recovery_onset_fraction=0.25,
     )
     sampler = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=False)
-    assert sampler.recovery_pool_size == 4
-    assert sampler.normal_pool_size == 4
+    assert sampler.recovery_pool_size == 1
+    assert sampler.normal_pool_size == 6
     assert quality.recovery_anchor_mask().tolist() == [
+        False,
         True,
-        True,
-        True,
-        True,
+        False,
+        False,
         False,
         False,
         False,
@@ -202,7 +207,7 @@ def test_masked_forward() -> None:
             ]
         ),
         "action_is_pad": torch.zeros(2, 4, dtype=torch.bool),
-        "index": torch.tensor([0, 4]),
+        "index": torch.tensor([0, 6]),
     }
     loss, metrics = policy(batch)
     assert torch.isclose(loss, torch.tensor(11.0))  # L1=1, valid KL=1, kl_weight=10
@@ -217,6 +222,28 @@ def test_masked_forward() -> None:
     per_sample, _ = policy(batch, reduction="none")
     assert torch.isclose(per_sample[0], torch.tensor(0.0))
     assert torch.isclose(per_sample[1], torch.tensor(11.0))
+
+
+def test_chunk_crosses_recovery_end() -> None:
+    """A label-2 anchor may predict a continuous 2->1 action chunk across E."""
+    config = _config()
+    policy = ACTQualityPolicy(config)
+    quality = _quality_index()
+    policy.set_quality_index(quality)
+    recorder = RecordingModel(config.latent_dim)
+    policy.model = recorder
+    policy.train()
+    batch = {
+        OBS_STATE: torch.zeros(1, 2),
+        OBS_ENV_STATE: torch.zeros(1, 2),
+        ACTION: torch.ones(1, 4, 2),
+        "action_is_pad": torch.zeros(1, 4, dtype=torch.bool),
+        "index": torch.tensor([2]),
+    }
+    loss, metrics = policy(batch)
+    assert torch.isclose(loss, torch.tensor(11.0))
+    assert not recorder.last_batch["action_is_pad"].any()
+    assert metrics["quality_recovery_anchor_fraction"] == 1.0
 
 
 def test_parquet_alignment() -> None:
@@ -252,9 +279,30 @@ def test_ternary_parquet_alignment() -> None:
         pd.DataFrame(
             {
                 "index": np.arange(8, dtype=np.int64),
-                "action_quality": np.array([0, 0, 2, 2, 1, 1, 1, 1], dtype=np.int64),
+                "action_quality": np.array([0, 2, 2, 1, 1, 1, 1, 1], dtype=np.int64),
             }
         ).to_parquet(data_path, index=False)
+        manifest_path = root / "meta" / "quality_label_manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "label_key": "action_quality",
+                    "recovery_candidate_count": 2,
+                    "recovery_episode_count": 1,
+                    "all_valid_recovery_candidates": 1,
+                    "selections": {
+                        "0": {
+                            "kind": "recovery",
+                            "recovery_start_frame": 1,
+                            "recovery_end_frame": 3,
+                        },
+                        "1": {"kind": "all_valid"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         meta = SimpleNamespace(
             root=root,
             total_frames=8,
@@ -264,8 +312,18 @@ def test_ternary_parquet_alignment() -> None:
             ),
         )
         quality = QualityIndex.from_dataset_meta(meta, "action_quality")
-        assert quality.labels.tolist() == [0, 0, 2, 2, 1, 1, 1, 1]
+        assert quality.labels.tolist() == [0, 2, 2, 1, 1, 1, 1, 1]
         assert quality.recovery_episode_mask().tolist() == [True, False]
+        assert quality.recovery_onset_anchor_mask(30).tolist() == [
+            False,
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+        ]
 
 
 def main() -> None:
@@ -273,8 +331,9 @@ def main() -> None:
     test_upstream_act_compatibility()
     test_sampler()
     test_balanced_sampler()
-    test_all_valid_recovery_provenance()
+    test_post_recovery_normal_pool()
     test_masked_forward()
+    test_chunk_crosses_recovery_end()
     test_parquet_alignment()
     test_ternary_parquet_alignment()
     print("act_quality selftest: PASS")

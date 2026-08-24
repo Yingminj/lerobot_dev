@@ -13,7 +13,7 @@ The ACT network architecture and state-dict names are unchanged.  The package ad
 5. the same mask in reconstruction loss and the CVAE key-padding mask;
 6. zeroed invalid action tokens before the CVAE action projection;
 7. valid-element L1 and valid-sample KL renormalization;
-8. separate normal-success, recovery-onset, and recovery-remainder anchor pools
+8. separate normal-action, recovery-onset, and recovery-remainder anchor pools
    with configurable epoch quotas.
 
 ## ACT configuration inheritance
@@ -32,38 +32,41 @@ The preferred dataset dtype is scalar `int64`. For every episode, labels must
 have one of these forms:
 
 ```text
-1 1 1 1 ...       # normal-success episode
-0 0 0 2 2 2 ...   # invalid mistake prefix, valid recovery suffix
+1 1 1 1 ...             # normal-success or explicitly all-valid episode
+0 0 0 2 2 2 1 1 ...     # mistake prefix, active recovery, normal continuation
 ```
 
 The meanings are:
 
 - `0`: invalid target/anchor; excluded from reconstruction loss, CVAE action
   encoding, and the main sampler;
-- `1`: valid normal-success target/anchor;
-- `2`: valid recovery target/anchor.
+- `1`: valid normal-execution target/anchor, including frames after recovery E;
+- `2`: valid active-recovery target/anchor in `[S,E)`.
 
 Labels `1` and `2` use the same reconstruction and KL objectives. Their numeric
-values are never used as loss weights. Value `2` exists to preserve recovery
-provenance after masking so the sampler can split the recovery suffix into its
-first `quality_recovery_onset_steps` anchors and the remaining anchors.
+values are never used as loss weights. Value `2` exists so the sampler can
+split the active-recovery interval into its first
+`quality_recovery_onset_steps` anchors and the remaining anchors. Label `1`
+after E returns to the normal pool.
 
-Non-zero-to-zero transitions are rejected by default. Normal episodes must be
-all `1`; recovery episodes must be one `0` prefix followed by one `2` suffix.
-This validation allows the sampler to skip invalid prefixes efficiently.
+Normal/all-valid episodes must be entirely `1`. Recovery episodes must follow
+`0* -> 2+ -> 1*`; with the semantic labeling tool this is `[0,S)=0`,
+`[S,E)=2`, and `[E,end)=1`. Other transitions are rejected by default. This
+validation allows the sampler to skip invalid prefixes and stop recovery pools
+exactly at E.
 
 Legacy scalar `bool` datasets remain supported. They are canonicalized in
-memory to `0/1/2`: manifest-marked recovery `True` frames become `2`, normal
-`True` frames become `1`, and `False` remains `0`. New datasets should use
-ternary `int64`, because it preserves recovery provenance without a manifest.
+memory to `0/1/2`: manifest-marked recovery `True` frames become `2`, normal or
+`all_valid` `True` frames become `1`, and `False` remains `0`. Legacy bool data
+has no E boundary, so a recovery's valid suffix remains all `2`. New datasets
+should use ternary `int64` to represent `0→2→1` directly.
 
 When `meta/quality_label_manifest.json` is present, its `selections` identify
-recovery episodes, including recovery recordings intentionally labeled
-`all_valid`. Without the manifest, ternary data identifies recovery episodes
-directly from value `2`. Legacy bool data falls back to a non-empty `False`
-prefix plus a `True` suffix; in that fallback mode an all-valid recovery
-recording is indistinguishable from a normal success. Only non-zero frames enter
-the three valid anchor pools.
+true recovery episodes and explicitly reclassify `all_valid` candidates as
+normal. Manifest S/E boundaries are checked against parquet labels. Without the
+manifest, ternary data identifies recovery episodes directly from value `2`.
+Legacy bool data falls back to a non-empty `False` prefix plus a `True` suffix.
+Only non-zero frames enter the three valid anchor pools.
 
 ## Train
 
@@ -96,16 +99,16 @@ normalization through the upstream ACT processor pipeline.
 
 Balanced sampling is enabled by default. `quality_recovery_anchor_fraction`
 controls the exact total fraction of recovery anchors in each sampler epoch.
-`quality_recovery_onset_steps` defines the first `K` valid frames of every
-recovery suffix as onset anchors. `quality_recovery_onset_fraction` controls
+`quality_recovery_onset_steps` defines the first `K` label-2 frames of every
+active-recovery interval as onset anchors. `quality_recovery_onset_fraction` controls
 their fraction of the complete epoch and is included inside—not added on top
 of—the total recovery fraction.
 
 With the defaults, each epoch is exactly:
 
 ```text
-normal success       75%
-recovery onset       10%   (first 30 valid recovery anchors per episode)
+normal label 1       75%   (success data plus post-E normal continuation)
+recovery onset       10%   (first 30 label-2 anchors per recovery episode)
 recovery remainder   15%
 ```
 
