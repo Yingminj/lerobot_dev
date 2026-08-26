@@ -37,17 +37,18 @@ if TYPE_CHECKING:
 
 QUALITY_INVALID = 0
 QUALITY_NORMAL = 1
-QUALITY_RECOVERY = 2
+QUALITY_ROLLBACK = 2
+QUALITY_REENTRY = 3
 
 
 @dataclass(frozen=True)
 class QualitySamplingConfig:
-    """Runtime-only controls for normal/onset/remainder anchor sampling."""
+    """Runtime-only controls for normal/rollback/reentry anchor sampling."""
 
     balance_anchor_pools: bool = False
-    recovery_anchor_fraction: float = 0.25
-    recovery_onset_steps: int = 30
-    recovery_onset_fraction: float = 0.10
+    pool_mode: str = "merged"
+    recovery_anchor_fraction: float = 0.10
+    reentry_anchor_fraction: float = 0.05
     balanced_epoch_size: int = 0
 
 
@@ -78,11 +79,12 @@ class _AnchorPool:
 
 @dataclass(frozen=True)
 class QualityIndex:
-    """Dense canonical 0/1/2 labels indexed by absolute dataset frame index.
+    """Dense canonical semantic labels indexed by absolute dataset frame index.
 
     Bool datasets are upgraded in memory using manifest episode provenance:
-    False becomes 0, normal True becomes 1, and recovery True becomes 2.
-    Ternary datasets are already stored in this canonical representation.
+    False becomes 0, normal True becomes 1, and recovery True becomes 2. New
+    semantic datasets store 0/1/2/3 directly: 2 is rollback from S to M and 3
+    is reentry/alignment from M to E.
     """
 
     labels: torch.Tensor
@@ -99,10 +101,16 @@ class QualityIndex:
         return self.labels == QUALITY_NORMAL
 
     def recovery_frame_mask(self) -> torch.Tensor:
-        return self.labels == QUALITY_RECOVERY
+        return self.rollback_frame_mask() | self.reentry_frame_mask()
+
+    def rollback_frame_mask(self) -> torch.Tensor:
+        return self.labels == QUALITY_ROLLBACK
+
+    def reentry_frame_mask(self) -> torch.Tensor:
+        return self.labels == QUALITY_REENTRY
 
     def recovery_episode_mask(self) -> torch.Tensor:
-        """Return episode provenance, falling back to canonical label value 2."""
+        """Return episode provenance, falling back to labels 2 or 3."""
         if self.recovery_episode_flags is not None:
             if self.recovery_episode_flags.shape != self.episode_from_indices.shape:
                 raise ValueError(
@@ -119,7 +127,10 @@ class QualityIndex:
                 strict=True,
             )
         ):
-            flags[position] = bool((self.labels[start:stop] == QUALITY_RECOVERY).any())
+            segment = self.labels[start:stop]
+            flags[position] = bool(
+                ((segment == QUALITY_ROLLBACK) | (segment == QUALITY_REENTRY)).any()
+            )
         return flags
 
     @property
@@ -147,6 +158,14 @@ class QualityIndex:
         return int(self.recovery_frame_mask().sum().item())
 
     @property
+    def rollback_anchor_frames(self) -> int:
+        return int(self.rollback_frame_mask().sum().item())
+
+    @property
+    def reentry_anchor_frames(self) -> int:
+        return int(self.reentry_frame_mask().sum().item())
+
+    @property
     def normal_episodes(self) -> int:
         return int((~self.recovery_episode_mask()).sum().item())
 
@@ -160,30 +179,16 @@ class QualityIndex:
         return int((self.first_valid_indices == self.episode_to_indices).sum().item())
 
     def recovery_anchor_mask(self) -> torch.Tensor:
-        """Return a dense mask that is True only during active recovery (label 2)."""
+        """Return a dense mask that is True during label-2/3 recovery."""
         return self.recovery_frame_mask()
 
-    def recovery_onset_anchor_mask(self, onset_steps: int) -> torch.Tensor:
-        """Return the first ``onset_steps`` label-2 anchors of each recovery episode."""
-        if onset_steps <= 0:
-            raise ValueError(f"onset_steps must be > 0, got {onset_steps}.")
-        mask = torch.zeros(self.total_frames, dtype=torch.bool)
-        for is_recovery, start, stop in zip(
-            self.recovery_episode_mask().tolist(),
-            self.episode_from_indices.tolist(),
-            self.episode_to_indices.tolist(),
-            strict=True,
-        ):
-            if not is_recovery:
-                continue
-            recovery_offsets = torch.nonzero(
-                self.labels[start:stop] == QUALITY_RECOVERY,
-                as_tuple=False,
-            ).flatten()
-            if recovery_offsets.numel():
-                selected = recovery_offsets[:onset_steps] + start
-                mask[selected] = True
-        return mask
+    def rollback_anchor_mask(self) -> torch.Tensor:
+        """Return manually labeled S->M rollback anchors (label 2)."""
+        return self.rollback_frame_mask()
+
+    def reentry_anchor_mask(self) -> torch.Tensor:
+        """Return manually labeled M->E realignment/insertion anchors (label 3)."""
+        return self.reentry_frame_mask()
 
     @classmethod
     def from_dataset_meta(
@@ -193,7 +198,7 @@ class QualityIndex:
         *,
         require_monotonic: bool = True,
     ) -> QualityIndex:
-        """Read bool or ternary labels, canonicalize to 0/1/2, and validate."""
+        """Read legacy or semantic labels, canonicalize, and validate."""
         feature = dataset_meta.features.get(label_key)
         if feature is None:
             raise ValueError(f"Dataset is missing required quality feature {label_key!r}.")
@@ -245,7 +250,8 @@ class QualityIndex:
         allowed_values = {QUALITY_INVALID, QUALITY_NORMAL} if is_legacy_bool else {
             QUALITY_INVALID,
             QUALITY_NORMAL,
-            QUALITY_RECOVERY,
+            QUALITY_ROLLBACK,
+            QUALITY_REENTRY,
         }
         actual_values = set(raw_labels.unique().tolist())
         if not actual_values <= allowed_values:
@@ -277,6 +283,7 @@ class QualityIndex:
                 raise ValueError(f"Quality manifest has no selections object: {manifest_path}")
             recovery_episode_flags = torch.zeros(episode_from.numel(), dtype=torch.bool)
             manifest_starts: dict[int, int] = {}
+            manifest_mids: dict[int, int] = {}
             manifest_ends: dict[int, int] = {}
             all_valid_count = 0
             for raw_position, selection in selections.items():
@@ -299,6 +306,9 @@ class QualityIndex:
                     manifest_starts[position] = start + int(
                         selection["recovery_start_frame"]
                     )
+                    recovery_mid = selection.get("recovery_mid_frame")
+                    if recovery_mid is not None:
+                        manifest_mids[position] = start + int(recovery_mid)
                     recovery_end = selection.get("recovery_end_frame")
                     if recovery_end is not None:
                         manifest_ends[position] = start + int(recovery_end)
@@ -337,6 +347,7 @@ class QualityIndex:
             )
         else:
             manifest_starts = {}
+            manifest_mids = {}
             manifest_ends = {}
             if is_legacy_bool:
                 recovery_episode_flags = torch.zeros(episode_from.numel(), dtype=torch.bool)
@@ -359,16 +370,20 @@ class QualityIndex:
                     zip(episode_from.tolist(), episode_to.tolist(), strict=True)
                 ):
                     recovery_episode_flags[position] = bool(
-                        (raw_labels[start:stop] == QUALITY_RECOVERY).any()
+                        (
+                            (raw_labels[start:stop] == QUALITY_ROLLBACK)
+                            | (raw_labels[start:stop] == QUALITY_REENTRY)
+                        ).any()
                     )
                 logging.info(
-                    "[act_quality] %s is absent; ternary recovery provenance is inferred from "
-                    "label value 2.",
+                    "[act_quality] %s is absent; recovery provenance is inferred from "
+                    "semantic label values 2/3.",
                     manifest_path,
                 )
 
-        # Canonical in-memory representation is always 0/1/2. This lets old
-        # bool datasets use the same three-pool sampler without rewriting them.
+        # Legacy bool recovery frames become rollback label 2. They remain
+        # loadable, but semantic balanced sampling will fail fast when its
+        # requested reentry pool is absent.
         if is_legacy_bool:
             labels = torch.zeros_like(raw_labels)
             for is_recovery, start, stop in zip(
@@ -379,7 +394,7 @@ class QualityIndex:
             ):
                 valid = raw_labels[start:stop] != QUALITY_INVALID
                 segment = labels[start:stop]
-                segment[valid] = QUALITY_RECOVERY if is_recovery else QUALITY_NORMAL
+                segment[valid] = QUALITY_ROLLBACK if is_recovery else QUALITY_NORMAL
         else:
             labels = raw_labels.clone()
 
@@ -409,22 +424,40 @@ class QualityIndex:
                     )
                 continue
 
-            recovery_offsets = torch.nonzero(
-                segment == QUALITY_RECOVERY,
-                as_tuple=False,
+            rollback_offsets = torch.nonzero(
+                segment == QUALITY_ROLLBACK, as_tuple=False
             ).flatten()
-            if not recovery_offsets.numel():
+            reentry_offsets = torch.nonzero(
+                segment == QUALITY_REENTRY, as_tuple=False
+            ).flatten()
+            if not rollback_offsets.numel():
                 raise ValueError(
                     f"Recovery episode position {episode_pos} has no label "
-                    f"{QUALITY_RECOVERY} active-recovery frames."
+                    f"{QUALITY_ROLLBACK} rollback frames."
                 )
-            recovery_start = int(recovery_offsets[0])
-            recovery_end = int(recovery_offsets[-1]) + 1
-            has_exact_semantic_order = (
-                (segment[:recovery_start] == QUALITY_INVALID).all()
-                and (segment[recovery_start:recovery_end] == QUALITY_RECOVERY).all()
-                and (segment[recovery_end:] == QUALITY_NORMAL).all()
-            )
+            recovery_start = int(rollback_offsets[0])
+            if reentry_offsets.numel():
+                recovery_mid = int(reentry_offsets[0])
+                recovery_end = int(reentry_offsets[-1]) + 1
+                has_exact_semantic_order = (
+                    (segment[:recovery_start] == QUALITY_INVALID).all()
+                    and (segment[recovery_start:recovery_mid] == QUALITY_ROLLBACK).all()
+                    and recovery_mid > recovery_start
+                    and (segment[recovery_mid:recovery_end] == QUALITY_REENTRY).all()
+                    and (segment[recovery_end:] == QUALITY_NORMAL).all()
+                )
+                expected_order = "0* -> 2+ -> 3+ -> 1*"
+            else:
+                # Backward-compatible loading for old ternary datasets. The
+                # semantic sampler rejects these if a non-zero reentry quota is
+                # requested, preventing accidental fixed-frame fallback.
+                recovery_end = int(rollback_offsets[-1]) + 1
+                has_exact_semantic_order = (
+                    (segment[:recovery_start] == QUALITY_INVALID).all()
+                    and (segment[recovery_start:recovery_end] == QUALITY_ROLLBACK).all()
+                    and (segment[recovery_end:] == QUALITY_NORMAL).all()
+                )
+                expected_order = "0* -> 2+ -> 1* (legacy)"
             if not has_exact_semantic_order:
                 change_offsets = (
                     torch.nonzero(segment[1:] != segment[:-1], as_tuple=False)
@@ -437,20 +470,23 @@ class QualityIndex:
                     for offset in change_offsets[:12]
                 ]
                 raise ValueError(
-                    f"Recovery episode position {episode_pos} must follow 0* -> 2+ -> 1*, "
+                    f"Recovery episode position {episode_pos} must follow {expected_order}, "
                     f"got transitions (offset, from, to) {transition_summary}."
                 )
 
         for position, expected_start in manifest_starts.items():
             episode_start = int(episode_from[position])
             episode_stop = int(episode_to[position])
-            recovery_indices = torch.nonzero(
-                labels[episode_start:episode_stop] == QUALITY_RECOVERY,
-                as_tuple=False,
+            segment = labels[episode_start:episode_stop]
+            rollback_indices = torch.nonzero(
+                segment == QUALITY_ROLLBACK, as_tuple=False
+            ).flatten()
+            reentry_indices = torch.nonzero(
+                segment == QUALITY_REENTRY, as_tuple=False
             ).flatten()
             actual_start = (
-                episode_start + int(recovery_indices[0])
-                if recovery_indices.numel()
+                episode_start + int(rollback_indices[0])
+                if rollback_indices.numel()
                 else episode_stop
             )
             if actual_start != expected_start:
@@ -458,13 +494,26 @@ class QualityIndex:
                     f"Quality manifest recovery start for episode position {position} is "
                     f"{expected_start}, but parquet label 2 starts at {actual_start}."
                 )
+            expected_mid = manifest_mids.get(position)
+            if expected_mid is not None:
+                actual_mid = (
+                    episode_start + int(reentry_indices[0])
+                    if reentry_indices.numel()
+                    else episode_stop
+                )
+                if actual_mid != expected_mid:
+                    raise ValueError(
+                        f"Quality manifest recovery mid for episode position {position} is "
+                        f"{expected_mid}, but parquet label 3 starts at {actual_mid}."
+                    )
             expected_end = manifest_ends.get(position)
             if expected_end is not None:
-                actual_end = episode_start + int(recovery_indices[-1]) + 1
+                active_indices = torch.cat((rollback_indices, reentry_indices)).sort().values
+                actual_end = episode_start + int(active_indices[-1]) + 1
                 if actual_end != expected_end:
                     raise ValueError(
                         f"Quality manifest recovery end for episode position {position} is "
-                        f"{expected_end}, but parquet label 2 ends at {actual_end}."
+                        f"{expected_end}, but active semantic labels end at {actual_end}."
                     )
 
         result = cls(
@@ -476,9 +525,10 @@ class QualityIndex:
             recovery_episode_flags=recovery_episode_flags,
         )
         logging.info(
-            "[act_quality] loaded %s (%s -> canonical int64 0/1/2): %d frames, "
+            "[act_quality] loaded %s (%s -> canonical semantic labels): %d frames, "
             "%d invalid target frames, "
-            "%d invalid anchors, %d normal anchors, %d recovery anchors, "
+            "%d invalid anchors, %d normal anchors, %d rollback anchors, "
+            "%d reentry anchors, %d total recovery anchors, "
             "%d normal episodes, %d recovery episodes, %d episodes without valid anchors",
             label_key,
             label_dtype,
@@ -486,6 +536,8 @@ class QualityIndex:
             result.invalid_frames,
             result.invalid_anchor_frames,
             result.normal_anchor_frames,
+            result.rollback_anchor_frames,
+            result.reentry_anchor_frames,
             result.recovery_anchor_frames,
             result.normal_episodes,
             result.recovery_episodes,
@@ -502,23 +554,26 @@ def activate_quality_index(
     quality_index: QualityIndex,
     *,
     balance_anchor_pools: bool = False,
-    recovery_anchor_fraction: float = 0.25,
-    recovery_onset_steps: int = 30,
-    recovery_onset_fraction: float = 0.10,
+    pool_mode: str = "merged",
+    recovery_anchor_fraction: float = 0.10,
+    reentry_anchor_fraction: float = 0.05,
     balanced_epoch_size: int = 0,
 ) -> None:
     """Make the index and sampling policy available to the train-process hook."""
+    if pool_mode not in {"merged", "semantic"}:
+        raise ValueError(f"pool_mode must be 'merged' or 'semantic', got {pool_mode!r}.")
     if not 0.0 <= recovery_anchor_fraction <= 1.0:
         raise ValueError(
             f"recovery_anchor_fraction must be in [0, 1], got {recovery_anchor_fraction}."
         )
-    if recovery_onset_steps <= 0:
-        raise ValueError(f"recovery_onset_steps must be > 0, got {recovery_onset_steps}.")
-    if not 0.0 <= recovery_onset_fraction <= recovery_anchor_fraction:
+    if not 0.0 <= reentry_anchor_fraction <= 1.0:
         raise ValueError(
-            "recovery_onset_fraction must be in [0, recovery_anchor_fraction], got "
-            f"{recovery_onset_fraction} and recovery_anchor_fraction="
-            f"{recovery_anchor_fraction}."
+            f"reentry_anchor_fraction must be in [0, 1], got {reentry_anchor_fraction}."
+        )
+    if pool_mode == "semantic" and reentry_anchor_fraction > recovery_anchor_fraction:
+        raise ValueError(
+            "In semantic mode reentry_anchor_fraction is part of the total recovery quota, got "
+            f"{reentry_anchor_fraction} > {recovery_anchor_fraction}."
         )
     if balanced_epoch_size < 0:
         raise ValueError(f"balanced_epoch_size must be >= 0, got {balanced_epoch_size}.")
@@ -526,22 +581,23 @@ def activate_quality_index(
     _ACTIVE_QUALITY_INDEX = quality_index
     _ACTIVE_SAMPLING_CONFIG = QualitySamplingConfig(
         balance_anchor_pools=balance_anchor_pools,
+        pool_mode=pool_mode,
         recovery_anchor_fraction=recovery_anchor_fraction,
-        recovery_onset_steps=recovery_onset_steps,
-        recovery_onset_fraction=recovery_onset_fraction,
+        reentry_anchor_fraction=reentry_anchor_fraction,
         balanced_epoch_size=balanced_epoch_size,
     )
 
 
 class QualityAwareEpisodeSampler(EpisodeAwareSampler):
-    """Filter invalid anchors and optionally balance three semantic anchor pools.
+    """Filter invalid anchors and balance merged or semantic anchor pools.
 
     Pools are determined per frame: label 1 is normal (including the post-E
-    suffix of a recovery episode), the first K label-2 frames are recovery
-    onset, and the remaining label-2 frames are recovery remainder. Manifest
-    ``all_valid`` candidates therefore stay in the normal pool. The balanced
-    epoch draws exact pool quotas, repeating shuffled passes only when a pool
-    is oversampled.
+    suffix of a recovery episode), label 2 is the manually delimited S->M
+    rollback interval, and label 3 is the manually delimited M->E realignment
+    and insertion interval. Merged mode samples labels 2/3 from one recovery
+    union; semantic mode gives them separate quotas. No boundary is inferred
+    from a fixed frame count. Manifest ``all_valid`` candidates stay in the
+    normal pool. Exact epoch quotas repeat shuffled passes only when needed.
     """
 
     def __init__(
@@ -588,15 +644,18 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
             absolute_to_relative_idx=absolute_to_relative_idx,
         )
         self._balance_anchor_pools = _ACTIVE_SAMPLING_CONFIG.balance_anchor_pools
+        self._pool_mode = _ACTIVE_SAMPLING_CONFIG.pool_mode
         self._normal_pool = _AnchorPool(
             starts=np.empty(0, dtype=np.int64),
             cumulative_lengths=np.empty(0, dtype=np.int64),
         )
-        self._recovery_onset_pool = self._normal_pool
-        self._recovery_remainder_pool = self._normal_pool
+        self._recovery_pool = self._normal_pool
+        self._rollback_pool = self._normal_pool
+        self._reentry_pool = self._normal_pool
         self._normal_samples_per_epoch = 0
-        self._recovery_onset_samples_per_epoch = 0
-        self._recovery_remainder_samples_per_epoch = 0
+        self._recovery_samples_per_epoch = 0
+        self._rollback_samples_per_epoch = 0
+        self._reentry_samples_per_epoch = 0
         self._absolute_to_relative_balanced = absolute_to_relative_idx
 
         if not self._balance_anchor_pools:
@@ -616,19 +675,23 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
         usable = used & (stops > starts)
         normal_mask = quality.normal_frame_mask().numpy()
         recovery_mask = quality.recovery_anchor_mask().numpy()
-        onset_mask = quality.recovery_onset_anchor_mask(
-            _ACTIVE_SAMPLING_CONFIG.recovery_onset_steps
-        ).numpy()
-        remainder_mask = recovery_mask & ~onset_mask
+        rollback_mask = quality.rollback_anchor_mask().numpy()
+        reentry_mask = quality.reentry_anchor_mask().numpy()
         self._normal_pool = self._make_mask_pool(normal_mask, starts, stops, usable)
-        self._recovery_onset_pool = self._make_mask_pool(
-            onset_mask,
+        self._recovery_pool = self._make_mask_pool(
+            recovery_mask,
             starts,
             stops,
             usable,
         )
-        self._recovery_remainder_pool = self._make_mask_pool(
-            remainder_mask,
+        self._rollback_pool = self._make_mask_pool(
+            rollback_mask,
+            starts,
+            stops,
+            usable,
+        )
+        self._reentry_pool = self._make_mask_pool(
+            reentry_mask,
             starts,
             stops,
             usable,
@@ -639,65 +702,97 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
         recovery_samples = int(
             np.floor(epoch_size * _ACTIVE_SAMPLING_CONFIG.recovery_anchor_fraction + 0.5)
         )
-        recovery_onset_samples = int(
-            np.floor(epoch_size * _ACTIVE_SAMPLING_CONFIG.recovery_onset_fraction + 0.5)
-        )
-        recovery_onset_samples = min(recovery_onset_samples, recovery_samples)
-        recovery_remainder_samples = recovery_samples - recovery_onset_samples
         normal_samples = epoch_size - recovery_samples
-        if recovery_onset_samples and self._recovery_onset_pool.size == 0:
-            raise ValueError(
-                "Balanced sampling requested recovery-onset anchors, but no onset anchor remains "
-                "after episode selection and frame dropping. Set "
-                "`quality_recovery_onset_fraction=0` or fix the labels."
-            )
-        if recovery_remainder_samples and self._recovery_remainder_pool.size == 0:
-            raise ValueError(
-                "Balanced sampling requested recovery-remainder anchors, but no remainder anchor "
-                "remains after episode selection and frame dropping. Set "
-                "`quality_recovery_onset_fraction=quality_recovery_anchor_fraction`, reduce "
-                "`quality_recovery_onset_steps`, or label longer active-recovery intervals."
-            )
         if normal_samples and self._normal_pool.size == 0:
             raise ValueError(
                 "Balanced sampling requested normal-success anchors, but no normal anchor remains "
                 "after episode selection and frame dropping. Set "
                 "`quality_recovery_anchor_fraction=1` or include normal demonstrations."
             )
+        if self._pool_mode == "merged":
+            if recovery_samples and self._recovery_pool.size == 0:
+                raise ValueError(
+                    "Merged balanced sampling requested recovery anchors, but no label-2/3 "
+                    "anchor remains after episode selection and frame dropping."
+                )
+            self._normal_samples_per_epoch = normal_samples
+            self._recovery_samples_per_epoch = recovery_samples
+            self._num_frames = epoch_size
+            normal_repeat = (
+                normal_samples / self._normal_pool.size if self._normal_pool.size else 0.0
+            )
+            recovery_repeat = (
+                recovery_samples / self._recovery_pool.size
+                if self._recovery_pool.size
+                else 0.0
+            )
+            logging.info(
+                "[act_quality] merged anchor pools: normal_unique=%d, recovery_unique=%d, "
+                "epoch_size=%d, normal_samples=%d (%.2f%%), recovery_samples=%d (%.2f%%), "
+                "sampling_factors=normal %.3fx/recovery %.3fx",
+                self._normal_pool.size,
+                self._recovery_pool.size,
+                epoch_size,
+                normal_samples,
+                100.0 * normal_samples / epoch_size,
+                recovery_samples,
+                100.0 * recovery_samples / epoch_size,
+                normal_repeat,
+                recovery_repeat,
+            )
+            return
 
+        reentry_samples = int(
+            np.floor(epoch_size * _ACTIVE_SAMPLING_CONFIG.reentry_anchor_fraction + 0.5)
+        )
+        reentry_samples = min(reentry_samples, recovery_samples)
+        rollback_samples = recovery_samples - reentry_samples
+        if rollback_samples and self._rollback_pool.size == 0:
+            raise ValueError(
+                "Semantic balanced sampling requested rollback anchors, but no label-2 S->M "
+                "anchor remains after episode selection and frame dropping. Fix the labels or "
+                "set `quality_reentry_anchor_fraction=quality_recovery_anchor_fraction`."
+            )
+        if reentry_samples and self._reentry_pool.size == 0:
+            raise ValueError(
+                "Semantic balanced sampling requested reentry anchors, but no label-3 M->E "
+                "anchor remains. This is an old 0/1/2 dataset or its semantic labels are "
+                "incomplete; build an S/M/E dataset before training."
+            )
         self._normal_samples_per_epoch = normal_samples
-        self._recovery_onset_samples_per_epoch = recovery_onset_samples
-        self._recovery_remainder_samples_per_epoch = recovery_remainder_samples
+        self._recovery_samples_per_epoch = recovery_samples
+        self._rollback_samples_per_epoch = rollback_samples
+        self._reentry_samples_per_epoch = reentry_samples
         self._num_frames = epoch_size
         normal_repeat = normal_samples / self._normal_pool.size if self._normal_pool.size else 0.0
-        onset_repeat = (
-            recovery_onset_samples / self._recovery_onset_pool.size
-            if self._recovery_onset_pool.size
+        rollback_repeat = (
+            rollback_samples / self._rollback_pool.size
+            if self._rollback_pool.size
             else 0.0
         )
-        remainder_repeat = (
-            recovery_remainder_samples / self._recovery_remainder_pool.size
-            if self._recovery_remainder_pool.size
+        reentry_repeat = (
+            reentry_samples / self._reentry_pool.size
+            if self._reentry_pool.size
             else 0.0
         )
         logging.info(
-            "[act_quality] balanced anchor pools: normal_unique=%d, onset_unique=%d, "
-            "remainder_unique=%d, epoch_size=%d, normal_samples=%d (%.2f%%), "
-            "onset_samples=%d (%.2f%%), remainder_samples=%d (%.2f%%), "
-            "sampling_factors=normal %.3fx/onset %.3fx/remainder %.3fx",
+            "[act_quality] semantic anchor pools: normal_unique=%d, rollback_unique=%d, "
+            "reentry_unique=%d, epoch_size=%d, normal_samples=%d (%.2f%%), "
+            "rollback_samples=%d (%.2f%%), reentry_samples=%d (%.2f%%), "
+            "sampling_factors=normal %.3fx/rollback %.3fx/reentry %.3fx",
             self._normal_pool.size,
-            self._recovery_onset_pool.size,
-            self._recovery_remainder_pool.size,
+            self._rollback_pool.size,
+            self._reentry_pool.size,
             epoch_size,
             normal_samples,
             100.0 * normal_samples / epoch_size,
-            recovery_onset_samples,
-            100.0 * recovery_onset_samples / epoch_size,
-            recovery_remainder_samples,
-            100.0 * recovery_remainder_samples / epoch_size,
+            rollback_samples,
+            100.0 * rollback_samples / epoch_size,
+            reentry_samples,
+            100.0 * reentry_samples / epoch_size,
             normal_repeat,
-            onset_repeat,
-            remainder_repeat,
+            rollback_repeat,
+            reentry_repeat,
         )
 
     @staticmethod
@@ -732,15 +827,17 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
 
     @property
     def recovery_pool_size(self) -> int:
-        return self.recovery_onset_pool_size + self.recovery_remainder_pool_size
+        if self._pool_mode == "merged":
+            return self._recovery_pool.size
+        return self.rollback_pool_size + self.reentry_pool_size
 
     @property
-    def recovery_onset_pool_size(self) -> int:
-        return self._recovery_onset_pool.size
+    def rollback_pool_size(self) -> int:
+        return self._rollback_pool.size
 
     @property
-    def recovery_remainder_pool_size(self) -> int:
-        return self._recovery_remainder_pool.size
+    def reentry_pool_size(self) -> int:
+        return self._reentry_pool.size
 
     @property
     def normal_samples_per_epoch(self) -> int:
@@ -748,18 +845,15 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
 
     @property
     def recovery_samples_per_epoch(self) -> int:
-        return (
-            self._recovery_onset_samples_per_epoch
-            + self._recovery_remainder_samples_per_epoch
-        )
+        return self._recovery_samples_per_epoch
 
     @property
-    def recovery_onset_samples_per_epoch(self) -> int:
-        return self._recovery_onset_samples_per_epoch
+    def rollback_samples_per_epoch(self) -> int:
+        return self._rollback_samples_per_epoch
 
     @property
-    def recovery_remainder_samples_per_epoch(self) -> int:
-        return self._recovery_remainder_samples_per_epoch
+    def reentry_samples_per_epoch(self) -> int:
+        return self._reentry_samples_per_epoch
 
     @property
     def indices(self) -> list[int]:
@@ -808,30 +902,41 @@ class QualityAwareEpisodeSampler(EpisodeAwareSampler):
             generator=generator,
             shuffle=self.shuffle,
         )
-        onset_positions = self._sample_pool_positions(
-            self._recovery_onset_pool.size,
-            self._recovery_onset_samples_per_epoch,
-            generator=generator,
-            shuffle=self.shuffle,
-        )
-        remainder_positions = self._sample_pool_positions(
-            self._recovery_remainder_pool.size,
-            self._recovery_remainder_samples_per_epoch,
-            generator=generator,
-            shuffle=self.shuffle,
-        )
         normal_indices = self._normal_pool.absolute_indices(normal_positions)
-        onset_indices = self._recovery_onset_pool.absolute_indices(onset_positions)
-        remainder_indices = self._recovery_remainder_pool.absolute_indices(
-            remainder_positions
+        if self._pool_mode == "merged":
+            recovery_positions = self._sample_pool_positions(
+                self._recovery_pool.size,
+                self._recovery_samples_per_epoch,
+                generator=generator,
+                shuffle=self.shuffle,
+            )
+            recovery_indices = self._recovery_pool.absolute_indices(recovery_positions)
+            if self.shuffle:
+                combined = torch.cat((normal_indices, recovery_indices))
+                return combined[torch.randperm(combined.numel(), generator=generator)]
+            return self._interleave_without_shuffle(normal_indices, recovery_indices)
+
+        rollback_positions = self._sample_pool_positions(
+            self._rollback_pool.size,
+            self._rollback_samples_per_epoch,
+            generator=generator,
+            shuffle=self.shuffle,
         )
+        reentry_positions = self._sample_pool_positions(
+            self._reentry_pool.size,
+            self._reentry_samples_per_epoch,
+            generator=generator,
+            shuffle=self.shuffle,
+        )
+        rollback_indices = self._rollback_pool.absolute_indices(rollback_positions)
+        reentry_indices = self._reentry_pool.absolute_indices(reentry_positions)
         if self.shuffle:
-            combined = torch.cat((normal_indices, onset_indices, remainder_indices))
+            combined = torch.cat((normal_indices, rollback_indices, reentry_indices))
             return combined[torch.randperm(combined.numel(), generator=generator)]
         return self._interleave_without_shuffle(
             normal_indices,
-            onset_indices,
-            remainder_indices,
+            rollback_indices,
+            reentry_indices,
         )
 
     def _iter_epoch(self, epoch: int, start: int) -> Iterator[int]:

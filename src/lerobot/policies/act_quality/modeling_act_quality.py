@@ -55,12 +55,12 @@ class ACTQualityPolicy(ACTPolicy):
             persistent=False,
         )
         self.register_buffer(
-            "_recovery_anchor_by_index",
+            "_rollback_anchor_by_index",
             torch.empty(0, dtype=torch.bool),
             persistent=False,
         )
         self.register_buffer(
-            "_recovery_onset_anchor_by_index",
+            "_reentry_anchor_by_index",
             torch.empty(0, dtype=torch.bool),
             persistent=False,
         )
@@ -84,18 +84,18 @@ class ACTQualityPolicy(ACTPolicy):
         self._quality_by_index = quality_index.valid_frame_mask().to(
             device=self.config.device
         )
-        self._recovery_anchor_by_index = quality_index.recovery_anchor_mask().to(
+        self._rollback_anchor_by_index = quality_index.rollback_anchor_mask().to(
             device=self.config.device
         )
-        self._recovery_onset_anchor_by_index = quality_index.recovery_onset_anchor_mask(
-            self.config.quality_recovery_onset_steps
-        ).to(device=self.config.device)
+        self._reentry_anchor_by_index = quality_index.reentry_anchor_mask().to(
+            device=self.config.device
+        )
         activate_quality_index(
             quality_index,
             balance_anchor_pools=self.config.quality_balance_anchor_pools,
+            pool_mode=self.config.quality_pool_mode,
             recovery_anchor_fraction=self.config.quality_recovery_anchor_fraction,
-            recovery_onset_steps=self.config.quality_recovery_onset_steps,
-            recovery_onset_fraction=self.config.quality_recovery_onset_fraction,
+            reentry_anchor_fraction=self.config.quality_reentry_anchor_fraction,
             balanced_epoch_size=self.config.quality_balanced_epoch_size,
         )
         if self.config.quality_filter_invalid_anchors:
@@ -108,7 +108,7 @@ class ACTQualityPolicy(ACTPolicy):
     def _quality_mask(
         self, batch: dict[str, Tensor]
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Return target validity plus anchor validity, recovery, and onset flags."""
+        """Return target validity plus anchor validity and semantic phase flags."""
         action = batch[ACTION]
         batch_size, horizon = action.shape[:2]
         if horizon != self.config.chunk_size:
@@ -129,9 +129,9 @@ class ACTQualityPolicy(ACTPolicy):
                     "with a labeled dataset_meta."
                 )
             valid = ~action_is_pad.bool()
-            recovery_anchor = torch.zeros(batch_size, dtype=torch.bool, device=valid.device)
-            recovery_onset_anchor = torch.zeros_like(recovery_anchor)
-            return valid, valid[:, 0], recovery_anchor, recovery_onset_anchor
+            rollback_anchor = torch.zeros(batch_size, dtype=torch.bool, device=valid.device)
+            reentry_anchor = torch.zeros_like(rollback_anchor)
+            return valid, valid[:, 0], rollback_anchor, reentry_anchor
 
         absolute_index = batch.get("index")
         if absolute_index is None:
@@ -159,14 +159,14 @@ class ACTQualityPolicy(ACTPolicy):
         target_indices = target_indices.clamp_max(self._quality_by_index.numel() - 1)
         target_quality = self._quality_by_index[target_indices]
         anchor_quality = self._quality_by_index[absolute_index]
-        recovery_anchor = self._recovery_anchor_by_index[absolute_index]
-        recovery_onset_anchor = self._recovery_onset_anchor_by_index[absolute_index]
+        rollback_anchor = self._rollback_anchor_by_index[absolute_index]
+        reentry_anchor = self._reentry_anchor_by_index[absolute_index]
 
         # An invalid current observation must never be paired with a distant valid
         # suffix in the same action chunk.  The sampler normally removes these
         # anchors; this guard makes the loss safe even in eval or custom loaders.
         valid = target_quality & anchor_quality.unsqueeze(1) & ~action_is_pad.bool()
-        return valid, anchor_quality, recovery_anchor, recovery_onset_anchor
+        return valid, anchor_quality, rollback_anchor, reentry_anchor
 
     def forward(
         self,
@@ -188,7 +188,7 @@ class ACTQualityPolicy(ACTPolicy):
             batch = dict(batch)
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        quality_mask, anchor_quality, recovery_anchor, recovery_onset_anchor = (
+        quality_mask, anchor_quality, rollback_anchor, reentry_anchor = (
             self._quality_mask(batch)
         )
         model_batch = dict(batch)
@@ -233,15 +233,17 @@ class ACTQualityPolicy(ACTPolicy):
             "l1_loss": float(l1_loss.detach()),
             "quality_valid_action_fraction": float(quality_mask.float().mean().detach()),
             "quality_invalid_anchor_fraction": float((~anchor_quality).float().mean().detach()),
-            "quality_recovery_anchor_fraction": float(recovery_anchor.float().mean().detach()),
-            "quality_recovery_onset_anchor_fraction": float(
-                recovery_onset_anchor.float().mean().detach()
+            "quality_recovery_anchor_fraction": float(
+                (rollback_anchor | reentry_anchor).float().mean().detach()
             ),
-            "quality_recovery_remainder_anchor_fraction": float(
-                (recovery_anchor & ~recovery_onset_anchor).float().mean().detach()
+            "quality_rollback_anchor_fraction": float(
+                rollback_anchor.float().mean().detach()
+            ),
+            "quality_reentry_anchor_fraction": float(
+                reentry_anchor.float().mean().detach()
             ),
             "quality_normal_anchor_fraction": float(
-                (anchor_quality & ~recovery_anchor).float().mean().detach()
+                (anchor_quality & ~rollback_anchor & ~reentry_anchor).float().mean().detach()
             ),
             "quality_valid_samples": int(valid_samples.sum().detach()),
         }

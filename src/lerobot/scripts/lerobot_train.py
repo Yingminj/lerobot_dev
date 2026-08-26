@@ -313,9 +313,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     active_cfg = cfg.trainable_config
     processor_pretrained_path = active_cfg.pretrained_path
+    keep_pretrained_normalization = bool(
+        processor_pretrained_path is not None
+        and (cfg.resume or getattr(active_cfg, "quality_keep_pretrained_normalization", False))
+    )
 
     processor_kwargs = {}
-    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
+    if not processor_pretrained_path or not keep_pretrained_normalization:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
     if cfg.is_reward_model_training:
@@ -324,20 +328,26 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         preprocessor_overrides = {
             "device_processor": {"device": device.type},
-            "normalizer_processor": {
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+        postprocessor_overrides = {}
+        if keep_pretrained_normalization:
+            if is_main_process:
+                logging.info(
+                    "Keeping normalization statistics from pretrained processor: "
+                    f"{processor_pretrained_path}"
+                )
+        else:
+            preprocessor_overrides["normalizer_processor"] = {
                 "stats": dataset.meta.stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
-            },
-            "rename_observations_processor": {"rename_map": cfg.rename_map},
-        }
-        postprocessor_overrides = {
-            "unnormalizer_processor": {
+            }
+            postprocessor_overrides["unnormalizer_processor"] = {
                 "stats": dataset.meta.stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
-            },
-        }
+            }
         if getattr(active_cfg, "use_relative_actions", False):
             preprocessor_overrides["relative_actions_processor"] = {
                 "enabled": True,

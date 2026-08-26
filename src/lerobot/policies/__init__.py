@@ -15,6 +15,7 @@
 from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterpolator
 
 from .act.configuration_act import ACTConfig as ACTConfig
+from .act_eef.configuration_act_eef import ACTEEFConfig as ACTEEFConfig
 from .act_delta.configuration_act_delta import ACTDeltaConfig as ACTDeltaConfig
 from .act_dit.configuration_act_dit import ACTDiTConfig as ACTDiTConfig
 from .act_quality.configuration_act_quality import ACTQualityConfig as ACTQualityConfig
@@ -48,6 +49,7 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 __all__ = [
     # Configuration classes
     "ACTConfig",
+    "ACTEEFConfig",
     "ACTDeltaConfig",
     "ACTDiTConfig",
     "ACTQualityConfig",

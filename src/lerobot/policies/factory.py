@@ -45,6 +45,7 @@ from lerobot.utils.constants import (
 from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
+from .act_eef.configuration_act_eef import ACTEEFConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
 from .evo1.configuration_evo1 import Evo1Config
@@ -115,6 +116,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .act.modeling_act import ACTPolicy
 
         return ACTPolicy
+    elif name == "act_eef":
+        from .act_eef.modeling_act_eef import ACTEEFPolicy
+
+        return ACTEEFPolicy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
@@ -219,6 +224,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return DiffusionConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
+    elif policy_type == "act_eef":
+        return ACTEEFConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":
@@ -378,6 +385,14 @@ def make_pre_post_processors(
         from .diffusion.processor_diffusion import make_diffusion_pre_post_processors
 
         processors = make_diffusion_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, ACTEEFConfig):
+        from .act_eef.processor_act_eef import make_act_eef_pre_post_processors
+
+        processors = make_act_eef_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

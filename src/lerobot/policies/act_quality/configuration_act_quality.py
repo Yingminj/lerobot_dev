@@ -48,9 +48,23 @@ class ACTQualityConfig(ACTConfig):
     quality_filter_invalid_anchors: bool = True
     quality_zero_masked_vae_actions: bool = True
     quality_balance_anchor_pools: bool = True
-    quality_recovery_anchor_fraction: float = 0.25
-    # Fractions are measured against the complete sampler epoch. The onset
-    # quota is part of (not additional to) quality_recovery_anchor_fraction.
+    # A warm-started ACT expects observations and actions in the normalization
+    # coordinates stored with the pretrained checkpoint. Keep those processor
+    # statistics by default so loading recovery data does not change the policy
+    # before the first optimizer step. From-scratch training still uses the
+    # current dataset statistics, and resume always keeps checkpoint statistics.
+    quality_keep_pretrained_normalization: bool = True
+    # `merged` is the conservative warm-start baseline: label 2/3 share one
+    # recovery pool. `semantic` gives rollback and reentry independent quotas.
+    quality_pool_mode: str = "merged"
+    quality_recovery_anchor_fraction: float = 0.10
+    # Semantic S/M/E sampling: label 2 is rollback (S->M), label 3 is reentry
+    # (M->E). The reentry quota is part of the total recovery quota; rollback
+    # receives the difference. Fractions are measured over the whole epoch.
+    quality_reentry_anchor_fraction: float = 0.05
+    # Deprecated checkpoint-compatibility fields. They are deliberately not
+    # used by the semantic sampler: no phase boundary is inferred from a fixed
+    # frame count anymore. Keep them so older checkpoints remain loadable.
     quality_recovery_onset_steps: int = 30
     quality_recovery_onset_fraction: float = 0.10
     quality_balanced_epoch_size: int = 0
@@ -59,26 +73,29 @@ class ACTQualityConfig(ACTConfig):
         super().__post_init__()
         if not self.quality_label_key:
             raise ValueError("`quality_label_key` must not be empty.")
+        if self.quality_pool_mode not in {"merged", "semantic"}:
+            raise ValueError(
+                "`quality_pool_mode` must be 'merged' or 'semantic', got "
+                f"{self.quality_pool_mode!r}."
+            )
         if not 0.0 <= self.quality_recovery_anchor_fraction <= 1.0:
             raise ValueError(
                 "`quality_recovery_anchor_fraction` must be in [0, 1], got "
                 f"{self.quality_recovery_anchor_fraction}."
             )
-        if self.quality_recovery_onset_steps <= 0:
+        if not 0.0 <= self.quality_reentry_anchor_fraction <= 1.0:
             raise ValueError(
-                "`quality_recovery_onset_steps` must be > 0, got "
-                f"{self.quality_recovery_onset_steps}."
+                "`quality_reentry_anchor_fraction` must be in [0, 1], got "
+                f"{self.quality_reentry_anchor_fraction}."
             )
-        if not 0.0 <= self.quality_recovery_onset_fraction <= 1.0:
+        if (
+            self.quality_pool_mode == "semantic"
+            and self.quality_reentry_anchor_fraction > self.quality_recovery_anchor_fraction
+        ):
             raise ValueError(
-                "`quality_recovery_onset_fraction` must be in [0, 1], got "
-                f"{self.quality_recovery_onset_fraction}."
-            )
-        if self.quality_recovery_onset_fraction > self.quality_recovery_anchor_fraction:
-            raise ValueError(
-                "`quality_recovery_onset_fraction` is part of the total recovery quota and "
+                "`quality_reentry_anchor_fraction` is part of the total recovery quota and "
                 "must be <= `quality_recovery_anchor_fraction`, got "
-                f"{self.quality_recovery_onset_fraction} > "
+                f"{self.quality_reentry_anchor_fraction} > "
                 f"{self.quality_recovery_anchor_fraction}."
             )
         if self.quality_balanced_epoch_size < 0:

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from torch import nn
 
@@ -20,6 +21,7 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 
+from .build_semantic_dataset import build_dataset
 from .configuration_act_quality import ACTQualityConfig
 from .modeling_act_quality import ACTQualityPolicy
 from .quality_index import QualityAwareEpisodeSampler, QualityIndex, activate_quality_index
@@ -66,7 +68,7 @@ def _config() -> ACTQualityConfig:
 
 def _quality_index() -> QualityIndex:
     labels = torch.tensor(
-        [0, 0, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1],
+        [0, 0, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1],
         dtype=torch.long,
     )
     return QualityIndex(
@@ -90,6 +92,7 @@ def test_upstream_act_compatibility() -> None:
     assert act_fields <= quality_fields
 
     quality_config = _config()
+    assert quality_config.quality_keep_pretrained_normalization
     act_kwargs = {
         field.name: getattr(quality_config, field.name)
         for field in fields(ACTConfig)
@@ -117,30 +120,31 @@ def test_balanced_sampler() -> None:
     activate_quality_index(
         quality,
         balance_anchor_pools=True,
+        pool_mode="semantic",
         recovery_anchor_fraction=0.5,
-        recovery_onset_steps=1,
-        recovery_onset_fraction=0.25,
+        reentry_anchor_fraction=0.25,
     )
     sampler = QualityAwareEpisodeSampler([0, 6], [6, 12], shuffle=True, seed=7)
     epoch_zero = list(iter(sampler))
     assert len(sampler) == 10
     assert sampler.normal_pool_size == 8
     assert sampler.recovery_pool_size == 2
-    assert sampler.recovery_onset_pool_size == 1
-    assert sampler.recovery_remainder_pool_size == 1
+    assert sampler.rollback_pool_size == 1
+    assert sampler.reentry_pool_size == 1
     assert sampler.normal_samples_per_epoch == 5
     assert sampler.recovery_samples_per_epoch == 5
-    assert sampler.recovery_onset_samples_per_epoch == 3
-    assert sampler.recovery_remainder_samples_per_epoch == 2
+    assert sampler.rollback_samples_per_epoch == 2
+    assert sampler.reentry_samples_per_epoch == 3
     assert sum(quality.labels[index].item() == 1 for index in epoch_zero) == 5
-    assert sum(quality.labels[index].item() == 2 for index in epoch_zero) == 5
+    assert sum(quality.labels[index].item() == 2 for index in epoch_zero) == 2
+    assert sum(quality.labels[index].item() == 3 for index in epoch_zero) == 3
 
     activate_quality_index(
         quality,
         balance_anchor_pools=True,
+        pool_mode="semantic",
         recovery_anchor_fraction=0.5,
-        recovery_onset_steps=1,
-        recovery_onset_fraction=0.25,
+        reentry_anchor_fraction=0.25,
     )
     reproduced = QualityAwareEpisodeSampler([0, 6], [6, 12], shuffle=True, seed=7)
     assert list(iter(reproduced)) == epoch_zero
@@ -148,18 +152,39 @@ def test_balanced_sampler() -> None:
     activate_quality_index(
         quality,
         balance_anchor_pools=True,
+        pool_mode="semantic",
         recovery_anchor_fraction=0.5,
-        recovery_onset_steps=1,
-        recovery_onset_fraction=0.25,
+        reentry_anchor_fraction=0.25,
     )
     resumed = QualityAwareEpisodeSampler([0, 6], [6, 12], shuffle=True, seed=7)
     resumed.load_state_dict({"epoch": 0, "start_index": 2})
     assert list(iter(resumed)) == epoch_zero[2:]
 
 
+def test_merged_sampler() -> None:
+    quality = _quality_index()
+    activate_quality_index(
+        quality,
+        balance_anchor_pools=True,
+        pool_mode="merged",
+        recovery_anchor_fraction=0.5,
+    )
+    sampler = QualityAwareEpisodeSampler([0, 6], [6, 12], shuffle=True, seed=11)
+    epoch = list(iter(sampler))
+    assert len(epoch) == 10
+    assert sampler.normal_pool_size == 8
+    assert sampler.recovery_pool_size == 2
+    assert sampler.normal_samples_per_epoch == 5
+    assert sampler.recovery_samples_per_epoch == 5
+    assert sampler.rollback_samples_per_epoch == 0
+    assert sampler.reentry_samples_per_epoch == 0
+    assert sum(quality.labels[index].item() == 1 for index in epoch) == 5
+    assert sum(quality.labels[index].item() in {2, 3} for index in epoch) == 5
+
+
 def test_post_recovery_normal_pool() -> None:
     quality = QualityIndex(
-        labels=torch.tensor([0, 2, 1, 1, 1, 1, 1, 1], dtype=torch.long),
+        labels=torch.tensor([0, 2, 3, 1, 1, 1, 1, 1], dtype=torch.long),
         episode_from_indices=torch.tensor([0, 4]),
         episode_to_indices=torch.tensor([4, 8]),
         first_valid_indices=torch.tensor([1, 4]),
@@ -169,17 +194,17 @@ def test_post_recovery_normal_pool() -> None:
     activate_quality_index(
         quality,
         balance_anchor_pools=True,
-        recovery_anchor_fraction=0.25,
-        recovery_onset_steps=1,
-        recovery_onset_fraction=0.25,
+        pool_mode="semantic",
+        recovery_anchor_fraction=0.50,
+        reentry_anchor_fraction=0.25,
     )
     sampler = QualityAwareEpisodeSampler([0, 4], [4, 8], shuffle=False)
-    assert sampler.recovery_pool_size == 1
-    assert sampler.normal_pool_size == 6
+    assert sampler.recovery_pool_size == 2
+    assert sampler.normal_pool_size == 5
     assert quality.recovery_anchor_mask().tolist() == [
         False,
         True,
-        False,
+        True,
         False,
         False,
         False,
@@ -271,15 +296,15 @@ def test_parquet_alignment() -> None:
         assert quality.labels.tolist() == [0, 0, 2, 2, 1, 1, 1, 1]
 
 
-def test_ternary_parquet_alignment() -> None:
-    with tempfile.TemporaryDirectory(prefix="act-quality-ternary-selftest-") as temporary:
+def test_semantic_parquet_alignment() -> None:
+    with tempfile.TemporaryDirectory(prefix="act-quality-semantic-selftest-") as temporary:
         root = Path(temporary)
         data_path = root / "data" / "chunk-000" / "file-000.parquet"
         data_path.parent.mkdir(parents=True)
         pd.DataFrame(
             {
                 "index": np.arange(8, dtype=np.int64),
-                "action_quality": np.array([0, 2, 2, 1, 1, 1, 1, 1], dtype=np.int64),
+                "action_quality": np.array([0, 2, 3, 1, 1, 1, 1, 1], dtype=np.int64),
             }
         ).to_parquet(data_path, index=False)
         manifest_path = root / "meta" / "quality_label_manifest.json"
@@ -295,6 +320,7 @@ def test_ternary_parquet_alignment() -> None:
                         "0": {
                             "kind": "recovery",
                             "recovery_start_frame": 1,
+                            "recovery_mid_frame": 2,
                             "recovery_end_frame": 3,
                         },
                         "1": {"kind": "all_valid"},
@@ -312,11 +338,21 @@ def test_ternary_parquet_alignment() -> None:
             ),
         )
         quality = QualityIndex.from_dataset_meta(meta, "action_quality")
-        assert quality.labels.tolist() == [0, 2, 2, 1, 1, 1, 1, 1]
+        assert quality.labels.tolist() == [0, 2, 3, 1, 1, 1, 1, 1]
         assert quality.recovery_episode_mask().tolist() == [True, False]
-        assert quality.recovery_onset_anchor_mask(30).tolist() == [
+        assert quality.rollback_anchor_mask().tolist() == [
             False,
             True,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+        ]
+        assert quality.reentry_anchor_mask().tolist() == [
+            False,
+            False,
             True,
             False,
             False,
@@ -326,16 +362,87 @@ def test_ternary_parquet_alignment() -> None:
         ]
 
 
+def test_semantic_dataset_builder() -> None:
+    with tempfile.TemporaryDirectory(prefix="act-quality-builder-selftest-") as temporary:
+        base = Path(temporary)
+        roots = {name: base / name for name in ("reentry", "finish")}
+        for root in roots.values():
+            (root / "data" / "chunk-000").mkdir(parents=True)
+            (root / "meta").mkdir()
+            pd.DataFrame(
+                {
+                    "index": np.arange(8, dtype=np.int64),
+                    "episode_index": np.repeat(np.arange(2, dtype=np.int64), 4),
+                    "frame_index": np.tile(np.arange(4, dtype=np.int64), 2),
+                    "action_quality": np.ones(8, dtype=np.int64),
+                }
+            ).to_parquet(root / "data" / "chunk-000" / "file-000.parquet", index=False)
+            (root / "meta" / "info.json").write_text(
+                json.dumps(
+                    {
+                        "total_episodes": 2,
+                        "total_frames": 8,
+                        "fps": 30,
+                        "data_path": "data/chunk-{episode_chunk:03d}/file-{file_index:03d}.parquet",
+                        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+                        "features": {
+                            "action_quality": {
+                                "dtype": "int64",
+                                "shape": [1],
+                                "names": None,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+        base_manifest = {
+            "label_key": "action_quality",
+            "recovery_candidate_count": 2,
+            "recovery_episode_count": 1,
+            "all_valid_recovery_candidates": 1,
+            "selections": {
+                "0": {
+                    "kind": "recovery",
+                    "source_episode_index": 0,
+                    "source_length": 4,
+                    "recovery_start_frame": 1,
+                    "recovery_end_frame": 2,
+                },
+                "1": {"kind": "all_valid", "source_episode_index": 1},
+            },
+        }
+        finish_manifest = json.loads(json.dumps(base_manifest))
+        finish_manifest["selections"]["0"]["recovery_end_frame"] = 3
+        for name, manifest in (("reentry", base_manifest), ("finish", finish_manifest)):
+            (roots[name] / "meta" / "quality_label_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+
+        output = base / "semantic"
+        manifest = build_dataset(roots["reentry"], roots["finish"], output)
+        labels = pq.read_table(
+            output / "data" / "chunk-000" / "file-000.parquet",
+            columns=["action_quality"],
+        )["action_quality"].to_pylist()
+        assert labels == [0, 2, 3, 1, 1, 1, 1, 1]
+        assert manifest["rollback_frames"] == 1
+        assert manifest["reentry_frames"] == 1
+        assert manifest["selections"]["0"]["recovery_mid_frame"] == 2
+
+
 def main() -> None:
     test_registration()
     test_upstream_act_compatibility()
     test_sampler()
     test_balanced_sampler()
+    test_merged_sampler()
     test_post_recovery_normal_pool()
     test_masked_forward()
     test_chunk_crosses_recovery_end()
     test_parquet_alignment()
-    test_ternary_parquet_alignment()
+    test_semantic_parquet_alignment()
+    test_semantic_dataset_builder()
     print("act_quality selftest: PASS")
 
 
