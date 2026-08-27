@@ -256,7 +256,7 @@ class PatchPolicyConfig(PreTrainedConfig):
     use_robot_state: bool = False
 
     # Block-causal GPT trunk (`action_head="vqbet"` only). Reference: `models/vq_behavior_transformer/gpt.py`.
-    gpt_block_size: int | None = None  # None -> n_obs_steps + action_chunk_size, as in bet.py
+    gpt_block_size: int | None = None  # None -> n_obs_steps (the trunk only sees observation frames)
     gpt_input_dim: int | None = None  # None -> the encoder's feature dim, measured at build time
     gpt_n_layer: int = 8
     gpt_n_head: int = 8
@@ -325,8 +325,11 @@ class PatchPolicyConfig(PreTrainedConfig):
                 f"({self.action_chunk_size})."
             )
         if self.gpt_block_size is None:
-            # `bet.py`: block_size=obs_window_size + act_window_size.
-            self.gpt_block_size = self.n_obs_steps + self.action_chunk_size
+            # `bet.py` uses obs_window_size + act_window_size because its trunk is fed action
+            # tokens too. Here the trunk only ever sees `n_obs_steps` frames, and every extra
+            # slot costs a (block_size*n_patches)^2 mask and n_patches*hidden_dim unused
+            # position embeddings -- 1.8 GB and 21M dead parameters at 3 cameras / 256 patches.
+            self.gpt_block_size = self.n_obs_steps
         if self.gpt_block_size < self.n_obs_steps:
             raise ValueError(
                 f"`gpt_block_size` ({self.gpt_block_size}) must be at least `n_obs_steps` "

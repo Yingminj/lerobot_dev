@@ -127,12 +127,18 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.gpt_n_head, C // self.gpt_n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.gpt_n_head, C // self.gpt_n_head).transpose(1, 2)  # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # Causal self-attention through SDPA rather than an explicit (B, nh, T, T) score
+        # matrix: patch_policy's block-causal trunk runs T = n_obs_steps * n_patches tokens
+        # (3840 for 5 steps x 3 cameras x 256 patches), where materializing the scores costs
+        # ~3.5 GiB per layer per tensor and OOMs an 48 GB card. `bias` is a float tril here and
+        # a bool block-causal mask in patch_policy; `!= 0` makes both a keep-mask.
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=self.bias[:, :, :T, :T] != 0,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+        )
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
