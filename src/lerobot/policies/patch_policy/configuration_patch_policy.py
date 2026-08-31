@@ -265,7 +265,7 @@ class PatchPolicyConfig(PreTrainedConfig):
     dropout: float = 0.1
 
     # VQ-BeT head. Reference: `models/vq_behavior_transformer/{bet,vqvae}.py`.
-    n_vqvae_training_steps: int = 20000
+    n_vqvae_training_steps: int = 5000
     vqvae_n_embed: int = 16
     vqvae_embedding_dim: int = 512  # reference `vqvae_latent_dim: 512`
     vqvae_enc_hidden_dim: int = 128
