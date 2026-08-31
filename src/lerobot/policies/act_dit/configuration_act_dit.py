@@ -40,6 +40,22 @@ class ACTDiTConfig(ACTConfig):
     Args (on top of `ACTConfig`):
         objective: "flow_matching" (default, 4-10 inference steps) or "diffusion".
         timestep_embed_dim: Width of the sinusoidal timestep embedding feeding adaLN.
+        state_in_adaln: Route `observation.state` into the adaLN conditioning vector on top
+            of its encoder token. Default False, and that default is a measured one: with it
+            True the decoder gets a full-bandwidth, multiplicative, per-layer road from the
+            robot state, which is strictly cheaper to fit than cross-attention over ~900
+            visual tokens. Within a few hundred steps the network shuts the observation
+            encoder off (the last encoder layer's output LayerNorm gain shrinks toward zero,
+            and with it every gradient that would reach the cameras), and the policy
+            degenerates into a proprioception -> trajectory map that replays the nominal
+            demonstration whatever the scene shows. See
+            `paper/policy/experiment_report/act_dit/act_dit-encoder-collapse-2026-08.md`.
+            With it False, adaLN carries the flow timestep only and the state reaches the
+            decoder exactly the way plain ACT delivers it: as one encoder token.
+            Checkpoints written before this field existed were trained with the state on
+            adaLN, and their `config.json` has no `state_in_adaln` key, so they load against
+            the new default and fail loudly on the adaLN `Linear` shape. Add
+            `"state_in_adaln": true` to such a `config.json` to load one as it was trained.
         use_cross_attention: Ablation switch. True (default) keeps ACT's token-level
             cross-attention over the ~900 encoder tokens - the whole point of S1. False
             drops it and mean-pools the encoder output into the adaLN conditioning vector
@@ -72,6 +88,7 @@ class ACTDiTConfig(ACTConfig):
     objective: str = "flow_matching"  # "flow_matching" or "diffusion"
     timestep_embed_dim: int = 256
     use_cross_attention: bool = True
+    state_in_adaln: bool = False
 
     # --- Flow matching (objective="flow_matching") ---
     sigma_min: float = 0.0
