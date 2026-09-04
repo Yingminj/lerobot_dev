@@ -50,7 +50,7 @@ PATCH_ENCODER_PRESETS: dict[str, dict] = {
     },
     "dinov3_patch": {
         "encoder_type": "dinov3",
-        "name": "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+        "name": "dinov3_vits16plus",
         "feature_key": "x_norm_patchtokens",
         "postprocess": None,
         "output_dim": 384,
@@ -58,7 +58,7 @@ PATCH_ENCODER_PRESETS: dict[str, dict] = {
     },
     "dinov3_cls": {
         "encoder_type": "dinov3",
-        "name": "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+        "name": "dinov3_vits16plus",
         "feature_key": "x_norm_clstoken",
         "postprocess": None,
         "output_dim": 384,
@@ -66,7 +66,7 @@ PATCH_ENCODER_PRESETS: dict[str, dict] = {
     },
     "dinov3_patch_avg_pool": {
         "encoder_type": "dinov3",
-        "name": "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+        "name": "dinov3_vits16plus",
         "feature_key": "x_norm_patchtokens",
         "postprocess": "avg_pool",
         "output_dim": 384,
@@ -214,7 +214,9 @@ class PatchPolicyConfig(PreTrainedConfig):
               queries are learned action-position embeddings and the loss is L1, i.e. ACT's head
               reading the same block-causally masked patch memory.
         vision_encoder: Key into `PATCH_ENCODER_PRESETS`, one entry per `configs/encoder/*.yaml`.
-        vision_encoder_checkpoint: Path to a `.pt` file, for the `"dynamo"` preset only.
+        vision_encoder_checkpoint: Local weights path. A `.pt` file for the `"dynamo"` preset
+            (where it is required), or one of Meta's `dinov3_*.pth` hub checkpoints for the
+            `"dinov3_*"` presets (where it is optional; omit it to download the default).
         resize_shape: Images are resized to this before the frozen encoder. 224x224 in every
             reference config; 256x256 for V-JEPA 2.
         freeze_vision_encoder: The paper never fine-tunes the backbone. Set False at your own risk.
