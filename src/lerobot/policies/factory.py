@@ -55,6 +55,7 @@ from .groot.configuration_groot import GrootConfig
 from .lingbot_va.configuration_lingbot_va import LingBotVAConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
+from .patch_new_policy.configuration_patch_new_policy import PatchNewPolicyConfig
 from .patch_policy.configuration_patch_policy import PatchPolicyConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
@@ -136,6 +137,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .patch_policy.modeling_patch_policy import PatchPolicy
 
         return PatchPolicy
+    elif name == "patch_new_policy":
+        from .patch_new_policy.modeling_patch_new_policy import PatchNewPolicy
+
+        return PatchNewPolicy
     elif name == "pi0":
         from .pi0.modeling_pi0 import PI0Policy
 
@@ -234,6 +239,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return VitaConfig(**kwargs)
     elif policy_type == "patch_policy":
         return PatchPolicyConfig(**kwargs)
+    elif policy_type == "patch_new_policy":
+        return PatchNewPolicyConfig(**kwargs)
     elif policy_type == "pi0":
         return PI0Config(**kwargs)
     elif policy_type == "pi05":
@@ -435,6 +442,16 @@ def make_pre_post_processors(
         from .patch_policy.processor_patch_policy import make_patch_policy_pre_post_processors
 
         processors = make_patch_policy_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, PatchNewPolicyConfig):
+        from .patch_new_policy.processor_patch_new_policy import (
+            make_patch_new_policy_pre_post_processors,
+        )
+
+        processors = make_patch_new_policy_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
