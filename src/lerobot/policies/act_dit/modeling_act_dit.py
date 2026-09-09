@@ -280,7 +280,8 @@ class ACTDiT(ACT):
         encoder_out, encoder_pos_embed = self.encode_observations(batch)
 
         static_cond = []
-        if self.config.robot_state_feature:
+        if self.config.robot_state_feature and self.config.state_in_adaln:
+            # Off by default: this road starves the encoder within a few hundred steps.
             # Reuses the encoder's state projection: the same 512-d embedding already exists
             # as an encoder token, no reason to learn a second one.
             static_cond.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
@@ -327,7 +328,7 @@ class ACTDiT(ACT):
 
 def _static_cond_dim(config: ACTDiTConfig) -> int:
     """Width of the chunk-constant part of the adaLN conditioning vector."""
-    dim = config.dim_model if config.robot_state_feature else 0
+    dim = config.dim_model if (config.robot_state_feature and config.state_in_adaln) else 0
     if not config.use_cross_attention:
         dim += config.dim_model  # mean-pooled encoder output
     return dim

@@ -50,7 +50,7 @@ PATCH_ENCODER_PRESETS: dict[str, dict] = {
     },
     "dinov3_patch": {
         "encoder_type": "dinov3",
-        "name": "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+        "name": "dinov3_vits16plus",
         "feature_key": "x_norm_patchtokens",
         "postprocess": None,
         "output_dim": 384,
@@ -58,7 +58,7 @@ PATCH_ENCODER_PRESETS: dict[str, dict] = {
     },
     "dinov3_cls": {
         "encoder_type": "dinov3",
-        "name": "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+        "name": "dinov3_vits16plus",
         "feature_key": "x_norm_clstoken",
         "postprocess": None,
         "output_dim": 384,
@@ -66,7 +66,7 @@ PATCH_ENCODER_PRESETS: dict[str, dict] = {
     },
     "dinov3_patch_avg_pool": {
         "encoder_type": "dinov3",
-        "name": "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+        "name": "dinov3_vits16plus",
         "feature_key": "x_norm_patchtokens",
         "postprocess": "avg_pool",
         "output_dim": 384,
@@ -214,7 +214,9 @@ class PatchPolicyConfig(PreTrainedConfig):
               queries are learned action-position embeddings and the loss is L1, i.e. ACT's head
               reading the same block-causally masked patch memory.
         vision_encoder: Key into `PATCH_ENCODER_PRESETS`, one entry per `configs/encoder/*.yaml`.
-        vision_encoder_checkpoint: Path to a `.pt` file, for the `"dynamo"` preset only.
+        vision_encoder_checkpoint: Local weights path. A `.pt` file for the `"dynamo"` preset
+            (where it is required), or one of Meta's `dinov3_*.pth` hub checkpoints for the
+            `"dinov3_*"` presets (where it is optional; omit it to download the default).
         resize_shape: Images are resized to this before the frozen encoder. 224x224 in every
             reference config; 256x256 for V-JEPA 2.
         freeze_vision_encoder: The paper never fine-tunes the backbone. Set False at your own risk.
@@ -256,7 +258,7 @@ class PatchPolicyConfig(PreTrainedConfig):
     use_robot_state: bool = False
 
     # Block-causal GPT trunk (`action_head="vqbet"` only). Reference: `models/vq_behavior_transformer/gpt.py`.
-    gpt_block_size: int | None = None  # None -> n_obs_steps + action_chunk_size, as in bet.py
+    gpt_block_size: int | None = None  # None -> n_obs_steps (the trunk only sees observation frames)
     gpt_input_dim: int | None = None  # None -> the encoder's feature dim, measured at build time
     gpt_n_layer: int = 8
     gpt_n_head: int = 8
@@ -265,7 +267,7 @@ class PatchPolicyConfig(PreTrainedConfig):
     dropout: float = 0.1
 
     # VQ-BeT head. Reference: `models/vq_behavior_transformer/{bet,vqvae}.py`.
-    n_vqvae_training_steps: int = 20000
+    n_vqvae_training_steps: int = 5000
     vqvae_n_embed: int = 16
     vqvae_embedding_dim: int = 512  # reference `vqvae_latent_dim: 512`
     vqvae_enc_hidden_dim: int = 128
@@ -325,8 +327,11 @@ class PatchPolicyConfig(PreTrainedConfig):
                 f"({self.action_chunk_size})."
             )
         if self.gpt_block_size is None:
-            # `bet.py`: block_size=obs_window_size + act_window_size.
-            self.gpt_block_size = self.n_obs_steps + self.action_chunk_size
+            # `bet.py` uses obs_window_size + act_window_size because its trunk is fed action
+            # tokens too. Here the trunk only ever sees `n_obs_steps` frames, and every extra
+            # slot costs a (block_size*n_patches)^2 mask and n_patches*hidden_dim unused
+            # position embeddings -- 1.8 GB and 21M dead parameters at 3 cameras / 256 patches.
+            self.gpt_block_size = self.n_obs_steps
         if self.gpt_block_size < self.n_obs_steps:
             raise ValueError(
                 f"`gpt_block_size` ({self.gpt_block_size}) must be at least `n_obs_steps` "

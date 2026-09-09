@@ -30,6 +30,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
+
 import torch
 import torchvision
 from torch import Tensor, nn
@@ -126,16 +128,31 @@ class DinoV2Encoder(PatchEncoder):
 
 
 class DinoV3Encoder(PatchEncoder):
-    """`models/encoder/dinov3.py`. Note the reference skips 5 leading tokens (CLS + 4 registers)."""
+    """`models/encoder/dinov3.py`, loaded through torch.hub so a local `.pth` can be used directly.
 
-    def __init__(self, name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m", **kwargs):
+    The hub backbones expose the same `forward_features` dict as DINOv2, so `x_norm_patchtokens`
+    already excludes CLS and the 4 storage tokens - no register slicing needed. `checkpoint` is a
+    path (or URL) to one of Meta's `dinov3_*_pretrain_*.pth` files; without it the entrypoint
+    downloads its own default weights.
+    """
+
+    def __init__(self, name: str = "dinov3_vits16plus", checkpoint: str | None = None, **kwargs):
         super().__init__(**kwargs)
-        require_package("transformers", extra="patch_policy")
-        from transformers import AutoModel
+        # `torch.hub.load` is unusable here: the repo's `hubconf.py` imports its segmentation and
+        # detection heads, which pull in `torchmetrics` and other deps the backbone never touches.
+        # Fetch the same checkout, then import only `dinov3.hub.backbones`.
+        # ponytail: private torch API, stable across 1.x/2.x; inline the cache path if it moves.
+        repo_dir = torch.hub._get_cache_or_reload(
+            "facebookresearch/dinov3:main", force_reload=False, trust_repo=True, verbose=False
+        )
+        if repo_dir not in sys.path:
+            sys.path.insert(0, repo_dir)
+        from dinov3.hub import backbones
 
-        self.base_model = AutoModel.from_pretrained(name, trust_remote_code=True)
-        self.emb_dim = self.base_model.config.hidden_size
-        self.patch_size = self.base_model.config.patch_size
+        kw = {"weights": checkpoint} if checkpoint else {}
+        self.base_model = getattr(backbones, name)(**kw)
+        self.emb_dim = self.base_model.num_features
+        self.patch_size = self.base_model.patch_size
         self.register_buffer("mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1), persistent=False)
 
@@ -146,10 +163,7 @@ class DinoV3Encoder(PatchEncoder):
     def encode(self, x: Tensor) -> Tensor:
         assert x.max() <= 1.0 and x.min() >= 0, "expect 0..1 range"
         x = (x - self.mean) / self.std
-        hidden = self.base_model(pixel_values=x).last_hidden_state
-        if self.feature_key == CLS_TOKEN:
-            return hidden[:, 0, :]
-        return hidden[:, 5:, :]  # skip CLS + 4 register tokens
+        return self.base_model.forward_features(x)[self.feature_key]
 
 
 class WebSSLEncoder(PatchEncoder):

@@ -30,6 +30,9 @@ from .groot.configuration_groot import GrootConfig as GrootConfig
 from .lingbot_va.configuration_lingbot_va import LingBotVAConfig as LingBotVAConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config as MolmoAct2Config
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as MultiTaskDiTConfig
+from .patch_new_policy.configuration_patch_new_policy import (
+    PatchNewPolicyConfig as PatchNewPolicyConfig,
+)
 from .patch_policy.configuration_patch_policy import PatchPolicyConfig as PatchPolicyConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
