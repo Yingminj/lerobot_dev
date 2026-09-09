@@ -47,7 +47,6 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 from .act.configuration_act import ACTConfig
 from .act_eef.configuration_act_eef import ACTEEFConfig
 from .act_eef_cvae.configuration_act_eef_cvae import ACTEEFCVAEConfig
-from .act_eef_state_dropout.configuration_act_eef_state_dropout import ACTEEFStateDropoutConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
 from .evo1.configuration_evo1 import Evo1Config
@@ -127,10 +126,6 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .act_eef_cvae.modeling_act_eef_cvae import ACTEEFCVAEPolicy
 
         return ACTEEFCVAEPolicy
-    elif name == "act_eef_state_dropout":
-        from .act_eef_state_dropout.modeling_act_eef_state_dropout import ACTEEFStateDropoutPolicy
-
-        return ACTEEFStateDropoutPolicy
     elif name == "multi_task_dit":
         from .multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
@@ -243,8 +238,6 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return ACTEEFConfig(**kwargs)
     elif policy_type == "act_eef_cvae":
         return ACTEEFCVAEConfig(**kwargs)
-    elif policy_type == "act_eef_state_dropout":
-        return ACTEEFStateDropoutConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
     elif policy_type == "vqbet":
@@ -406,16 +399,6 @@ def make_pre_post_processors(
         from .diffusion.processor_diffusion import make_diffusion_pre_post_processors
 
         processors = make_diffusion_pre_post_processors(
-            config=policy_cfg,
-            dataset_stats=kwargs.get("dataset_stats"),
-        )
-
-    elif isinstance(policy_cfg, ACTEEFStateDropoutConfig):
-        from .act_eef_state_dropout.processor_act_eef_state_dropout import (
-            make_act_eef_state_dropout_pre_post_processors,
-        )
-
-        processors = make_act_eef_state_dropout_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
